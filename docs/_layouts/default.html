@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ page.title | escape }} · RoboPolicyKernel</title>
+  <meta name="description" content="{{ page.description | default: site.description | escape }}">
+  <meta name="theme-color" content="#163b35">
+  <link rel="icon" type="image/svg+xml" href="{{ '/assets/favicon.svg' | relative_url }}">
+  <link rel="stylesheet" href="{{ '/assets/site.css' | relative_url }}">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="{{ '/' | relative_url }}"><span class="brand-mark" aria-hidden="true">rk</span> RoboPolicyKernel</a>
+    <nav aria-label="Main navigation">
+      <a href="{{ '/#workflow' | relative_url }}">How it works</a>
+      <a href="{{ '/#quickstart' | relative_url }}">Quick start</a>
+      <a href="https://github.com/ratharva/RoboPolicyKernel">GitHub ↗</a>
+    </nav>
+  </header>
+  <div class="page-shell">
+    <aside class="sidebar">
+      <p class="eyebrow">Project guide</p>
+      <nav aria-label="On this site">
+        <a href="{{ '/#overview' | relative_url }}">Overview</a>
+        <a href="{{ '/#workflow' | relative_url }}">The pipeline</a>
+        <a href="{{ '/#datasets' | relative_url }}">Datasets & robots</a>
+        <a href="{{ '/#policies' | relative_url }}">Policy adapters</a>
+        <a href="{{ '/#quickstart' | relative_url }}">Your first run</a>
+        <a href="{{ '/#training' | relative_url }}">Inside training</a>
+        <a href="{{ '/#results' | relative_url }}">Results & recovery</a>
+        <a href="{{ '/#extending' | relative_url }}">Extending the project</a>
+        <a href="{{ '/#reference' | relative_url }}">Code & reference</a>
+      </nav>
+      <div class="sidebar-note">Ray Data + Ray Train<br>LeRobot policy implementations</div>
+    </aside>
+    <main id="content" tabindex="-1">{{ content }}</main>
+  </div>
+  <footer class="site-footer"><span>RoboPolicyKernel</span><span>A guide to the code, from raw episodes to training runs.</span><a href="https://github.com/ratharva/RoboPolicyKernel">Explore the repository ↗</a></footer>
+</body>
+</html>

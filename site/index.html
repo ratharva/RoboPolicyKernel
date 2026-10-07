@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Robot policy training, explained · RoboPolicyKernel</title>
+  <meta name="description" content="How RoboPolicyKernel prepares robot demonstrations and trains ACT, MolmoAct2, and π0.5 with Ray Data and Ray Train.">
+  <meta name="theme-color" content="#163b35">
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <a class="skip" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="./"><span class="brand-mark" aria-hidden="true">rk</span> RoboPolicyKernel</a>
+    <nav aria-label="Main navigation">
+      <a href="#workflow">How it works</a>
+      <a href="#quickstart">Quick start</a>
+      <a href="https://github.com/ratharva/RoboPolicyKernel">GitHub ↗</a>
+    </nav>
+  </header>
+  <div class="page-shell">
+    <aside class="sidebar">
+      <p class="eyebrow">Project guide</p>
+      <nav aria-label="On this site">
+        <a href="#overview">Overview</a>
+        <a href="#workflow">The pipeline</a>
+        <a href="#datasets">Datasets & robots</a>
+        <a href="#policies">Policy adapters</a>
+        <a href="#quickstart">Your first run</a>
+        <a href="#training">Inside training</a>
+        <a href="#results">Results & recovery</a>
+        <a href="#extending">Extending the project</a>
+        <a href="#reference">Code & reference</a>
+      </nav>
+      <div class="sidebar-note">Ray Data + Ray Train<br>LeRobot policy implementations</div>
+    </aside>
+    <main id="content" tabindex="-1"><div class="hero" id="overview">
+<p class="eyebrow">RoboPolicyKernel / Project guide</p>
+<h1>From robot demonstrations<br>to policy training.</h1>
+<p class="lede">A training pipeline built around a simple idea: changing the dataset or policy should not mean starting over with the rest of your code.</p>
+<p>RoboPolicyKernel prepares robot teleoperation data in LeRobot v3 format, loads it with Ray Data, and trains policies with Ray Train. It brings ACT, MolmoAct2, and π0.5 into the same workflow, with separate adapters for the parts each model does differently.</p>
+<div class="hero-actions">
+<a class="button" href="#quickstart">Run a small experiment ↓</a>
+<a class="button secondary" href="https://github.com/ratharva/RoboPolicyKernel">Read the code ↗</a>
+</div>
+<div class="facts"><span>3 policy families</span><span>4 dataset schemas</span><span>1 shared training loop</span></div>
+</div>
+<section class="section" id="workflow">
+<p><span class="section-number">01 / THE PIPELINE</span></p>
+<h2>Prepare once. Train from the result.</h2>
+<p>Robot demonstrations arrive in different forms: timestamped messages, videos alongside HDF5 arrays, or an existing LeRobot dataset. Before a model can learn from them, the camera frames, robot state, and actions need to agree on what happened at each step.</p>
+<p>The project puts that work in a separate preparation stage. Once the data is ready, you can run another training experiment without decoding the original recordings again.</p>
+<div aria-label="Pipeline: raw demonstrations, prepared LeRobot v3 data, policy training" class="pipeline">
+<div class="pipeline-step">
+<p class="eyebrow">01 · Prepare</p>
+<h3>Raw demonstrations</h3>
+<p>Discover episodes, read the source format, decode cameras, and align observations with actions.</p>
+</div>
+<div class="pipeline-step">
+<p class="eyebrow">02 · Store</p>
+<h3>LeRobot v3</h3>
+<p>Keep tabular data, videos, and episode metadata in a common format that training can read.</p>
+</div>
+<div class="pipeline-step">
+<p class="eyebrow">03 · Train</p>
+<h3>Ray Data → Ray Train</h3>
+<p>Build action chunks, prepare batches, run the policy, and record metrics and checkpoints.</p>
+</div>
+</div>
+<p><strong><code>training.prepare_data</code> owns the raw source.</strong> It chooses an ingestion strategy from the dataset schema. MCAP episodes go through the project's decoder and writer; existing LeRobot mirrors use LeRobot's migration tooling.</p>
+<p><strong><code>training.train</code> starts with a prepared dataset.</strong> It resolves the dataset location, builds the data pipeline, and starts the training workers. Pretrained policies load their model weights as part of training setup.</p>
+<p>With preparation and training separated, the same prepared episodes can feed multiple experiments. You can change the policy or training settings while reusing the data.</p>
+</section>
+<section class="section" id="datasets">
+<p><span class="section-number">02 / DATASETS &amp; ROBOTS</span></p>
+<h2>Different recordings, a common description.</h2>
+<p>Each file in <code>training/data_prep/schemas/</code> describes a dataset's camera names, state and action components, sampling rate, source location, and ingestion strategy. Those fields become a <code>RobotSchema</code> used by the rest of the pipeline.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Dataset source</th>
+<th>Input path</th>
+<th>What to know</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>abc130k</code></td>
+<td>XDOF/ABC-130k · MCAP + protobuf</td>
+<td>Decodes camera streams and aligns state/actions. Supports streaming or downloading raw episodes before conversion.</td>
+</tr>
+<tr>
+<td><code>agibot_alpha</code></td>
+<td>AgiBot World Alpha · HDF5 + tar</td>
+<td>Downloads archive shards and converts their HDF5 data and videos into prepared episodes.</td>
+</tr>
+<tr>
+<td><code>droid</code></td>
+<td><code>cadene/droid_1.0.1</code> · LeRobot v2.1</td>
+<td>Uses LeRobot's v2.1 → v3 migration to prepare the full mirror.</td>
+</tr>
+<tr>
+<td><code>droid_100</code></td>
+<td><code>lerobot/droid_100</code> · LeRobot v3</td>
+<td>A smaller mirror with its own schema. Its 7-dimensional state/action layout differs from the full DROID schema's 8-dimensional layout.</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3>Cameras and actions are part of the dataset contract</h3>
+<p>The schema records component names and dimensions in order. That order matters: it defines how the state and action vectors are assembled. Some datasets also expose depth cameras or alternative action spaces, such as joint and end-effector representations.</p>
+<p>A new robot that fits an existing ingestion format may only need another YAML file. Custom message structures and HDF5 layouts plug in through their own decoding strategy.</p>
+<h3>Reusing prepared episodes</h3>
+<p>The MCAP path tracks converted source episodes in a manifest. Growing an episode request can reuse existing conversions and append new ones. Use a separate output directory when you want to keep multiple prepared versions.</p>
+<p><a href="https://github.com/ratharva/RoboPolicyKernel/blob/main/docs/customizing-datasets.md">Dataset extension reference</a> · <a href="https://github.com/ratharva/RoboPolicyKernel/blob/main/training/data_prep/README.md">Preparation command reference</a></p>
+</section>
+<section class="section" id="policies">
+<p><span class="section-number">03 / POLICY ADAPTERS</span></p>
+<h2>Keep the model-specific work in the model.</h2>
+<p>The shared loop needs to know how to construct a policy and how to get a loss from a batch. Each policy adapter supplies those operations, along with hooks for things like distributed wrapping and checkpoint formats when needed.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Policy</th>
+<th>Adapter behavior</th>
+<th>Configuration to look at</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ACT</td>
+<td>Observation-to-action training without task text; uses the standard distributed path.</td>
+<td><code>training/configs/act_example.yaml</code></td>
+</tr>
+<tr>
+<td>MolmoAct2</td>
+<td>Uses task text; exposes LoRA, full fine-tuning, and freeze modes, with DDP or FSDP2 options.</td>
+<td><code>training/configs/molmoact2_example.yaml</code></td>
+</tr>
+<tr>
+<td>π0.5</td>
+<td>Loads a pretrained checkpoint and uses task text; exposes DDP and FSDP2 options and checkpoint-aware normalization.</td>
+<td><code>training/configs/pi05_example.yaml</code></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The adapter contract lives in <code>training/model/registry.py</code>. Its core operations are <code>build</code> and <code>forward_loss</code>; optional hooks cover distributed setup, saving/loading, and normalization. The loop handles batch iteration, optimization, reporting, and evaluation around them.</p>
+</section>
+<section class="section" id="quickstart">
+<p><span class="section-number">04 / YOUR FIRST RUN</span></p>
+<h2>Start with a small ACT experiment.</h2>
+<p>The commands below prepare 20 episodes of one ABC-130k task, then run at most 50 training steps. This gives you a short first experiment to explore the workflow. Run the commands from the repository root in your Python environment, with a CUDA-capable setup for GPU training.</p>
+<h3>1. Install the training dependencies</h3>
+<pre><code class="language-bash">pip install -r training/requirements.txt
+</code></pre>
+<p>For ABC-130k, accept the dataset's access terms and set <code>HF_TOKEN</code> in your environment before preparation. The requirements file also lists optional dependencies: <code>peft</code> for MolmoAct2 LoRA, <code>accelerate</code> for the FSDP2 paths, and <code>wandb</code> for W&amp;B logging.</p>
+<h3>2. Choose a task and prepare it</h3>
+<pre><code class="language-bash"># List tasks and episode counts.
+python -m training.data_prep.discover --dataset-source abc130k
+
+# Prepare a small set of episodes for training.
+python -m training.prepare_data \
+  --dataset-source abc130k \
+  --tasks arrange_the_flowers \
+  --max-episodes-per-task 20
+</code></pre>
+<p>The default output for this task is <code>training/lerobot_v3/abc130k/arrange_the_flowers</code>. You can choose another location with <code>--v3-root</code> and pass that same location to training.</p>
+<h3>3. Train on the prepared data</h3>
+<pre><code class="language-bash">python -m training.train \
+  --dataset-source abc130k \
+  --tasks arrange_the_flowers \
+  --policy-type act \
+  --max-train-steps 50 \
+  --storage-root training/runs \
+  --run-name act-first-run
+</code></pre>
+<p>The dataset flag lets training derive the preparation directory. Alternatively, pass <code>--v3-root</code> explicitly; the prepared metadata can identify the dataset source. <code>--policy-type</code> must be supplied explicitly.</p>
+<h3>4. Inspect the run</h3>
+<pre><code class="language-bash">python -m training.history --storage-root training/runs
+
+tensorboard --logdir training/runs/act-first-run/tensorboard
+</code></pre>
+<p>For repeatable experiments, move settings into a YAML config and override only what changes:</p>
+<pre><code class="language-bash">python -m training.train \
+  --dataset-source abc130k \
+  --tasks arrange_the_flowers \
+  --policy-type act \
+  --config-file training/configs/act_example.yaml \
+  --max-train-steps 50
+</code></pre>
+<p>Explicit CLI settings take precedence over the config file. The model's <code>type</code> in YAML must match <code>--policy-type</code>.</p>
+</section>
+<section class="section" id="training">
+<p><span class="section-number">05 / INSIDE TRAINING</span></p>
+<h2>What happens between a recording and a loss?</h2>
+<h3>Ray Data builds the model inputs</h3>
+<p>The reader loads the prepared episode data and cameras. The data pipeline forms future action chunks, handles padding at episode boundaries, and prepares image and state/action inputs. Where relative actions are requested, the conversion aligns action components with their corresponding state components by name.</p>
+<p>Normalization connects the current dataset to the pretrained model’s input conventions. The pipeline separates the normalization <em>mode</em> from the source of its <em>statistics</em>, so a run can use a checkpoint's expected scheme with statistics computed for the current dataset. π0.5 also selects <code>[0, 1]</code> image scaling by default.</p>
+<h3>Ray Train runs the workers</h3>
+<p>The driver builds the run configuration and launches a <code>TorchTrainer</code>. Each worker constructs its policy through the adapter and enters <code>train_loop.py</code>. The standard path uses Ray's PyTorch wrapping; the FSDP2 adapters supply their own wrapping and sharded checkpoint hooks.</p>
+<p>Settings include gradient accumulation, learning rates, mixed-precision options, and reporting intervals. Each policy keeps its own model settings in the corresponding config.</p>
+<h3>Validation, test, and early stopping have different jobs</h3>
+<p>By default, the configuration holds out 10% of episodes for validation. Splitting by episode keeps adjacent frames from the same demonstration together. You can also provide separate prepared roots for validation and test data.</p>
+<p>Validation loss determines checkpoint retention when validation is enabled. An optional test split provides a separate evaluation after training. Early stopping follows windowed training loss, while validation loss guides checkpoint selection.</p>
+</section>
+<section class="section" id="results">
+<p><span class="section-number">06 / RESULTS &amp; RECOVERY</span></p>
+<h2>A run should leave enough behind to understand it.</h2>
+<div class="two-col">
+<div>
+<h3>Metrics and history</h3>
+<p>TensorBoard logs live under the run directory. Optional W&amp;B logging adds another place to inspect metrics and recorded episode media. <code>ray_data_stats.txt</code> records data execution statistics, and <code>history.jsonl</code> under the storage root records the history of your runs.</p>
+</div>
+<div>
+<h3>Checkpoints and recovery</h3>
+<p>Checkpoint settings control retention and whether saving happens only on improvement. The default keeps the best-scoring checkpoints and the latest checkpoint for recovery. With validation disabled, checkpoint scoring falls back to training loss.</p>
+</div>
+</div>
+<p>Ray supports worker recovery within the same <code>trainer.fit()</code> call by restarting the worker and loading its checkpoint. The saved epoch, step, and epoch-completion marker distinguish a mid-epoch save from a completed epoch.</p>
+<p>The repository also includes opt-in asynchronous checkpoint writing for the standard DDP path. FSDP2 uses its adapter's separate checkpoint implementation.</p>
+<p><a href="https://github.com/ratharva/RoboPolicyKernel/blob/main/training/README.md">Training flags and scenarios</a> · <a href="https://github.com/ratharva/RoboPolicyKernel/blob/main/docs/05-view-results.md">Results and recovery reference</a></p>
+</section>
+<section class="section" id="extending">
+<p><span class="section-number">07 / EXTENDING THE PROJECT</span></p>
+<h2>Where a new dataset or policy fits.</h2>
+<h3>Add a dataset or robot</h3>
+<p>Start with the closest schema in <code>training/data_prep/schemas/</code>. Set the actual camera keys, state/action layout, sampling rate, source, and strategy-specific fields from the data you have inspected. Dataset choices are discovered from these YAML files.</p>
+<p>For a new raw format, add a module under <code>training/data_prep/strategies/</code>, register it, and wire its preparation path where needed. Some formats fit per-episode conversion; others need their own orchestration because episodes share archive files.</p>
+<h3>Add a policy</h3>
+<p>Implement <code>build_policy_and_processor</code> and <code>forward_loss</code> in a new model module. Add its adapter dispatch in <code>training/model/registry.py</code>, its typed overrides in <code>training/config.py</code>, and the CLI wiring in <code>training/train.py</code>. Supply wrapping and checkpoint hooks if the policy needs a custom distributed path.</p>
+<p>The adapter keeps model-specific changes local while the common loop continues to handle iteration, reporting, and checkpoint recovery.</p>
+<p><a href="https://github.com/ratharva/RoboPolicyKernel/blob/main/docs/extending.md">Step-by-step extension checklist</a></p>
+</section>
+<section class="section" id="reference">
+<p><span class="section-number">08 / KEEP EXPLORING</span></p>
+<h2>Find your way around the code.</h2>
+<pre><code class="language-text">training/
+├── common/         Robot schema, data config, Ray setup
+├── data_prep/      Source discovery, decoding, alignment, writing
+│   ├── schemas/    Dataset and robot descriptions
+│   └── strategies/ Raw-format-specific ingestion
+├── data/           Training-time reads, chunks, statistics
+├── model/          Policy adapters and normalization
+├── configs/        Example experiment configurations
+├── prepare_data.py Preparation entry point
+├── train.py        Training configuration and orchestration
+└── train_loop.py   Shared per-worker training loop
+</code></pre>
+<ul class="reference-list">
+<li><a href="https://github.com/ratharva/RoboPolicyKernel/blob/main/training/README.md">Training reference ↗</a><span>Flags, policy options, distributed runs</span></li>
+<li><a href="https://github.com/ratharva/RoboPolicyKernel/blob/main/training/data_prep/README.md">Data preparation reference ↗</a><span>Source-specific commands and conversion</span></li>
+<li><a href="https://github.com/ratharva/RoboPolicyKernel/tree/main/training/configs">Example configurations ↗</a><span>ACT, MolmoAct2, π0.5, logging and evaluation</span></li>
+<li><a href="https://github.com/ratharva/RoboPolicyKernel/blob/main/docs/extending.md">Extension guide ↗</a><span>New datasets, robots, and policies</span></li>
+</ul>
+</section></main>
+  </div>
+  <footer class="site-footer"><span>RoboPolicyKernel</span><span>A guide to the code, from raw episodes to training runs.</span><a href="https://github.com/ratharva/RoboPolicyKernel">Explore the repository ↗</a></footer>
+</body>
+</html>
