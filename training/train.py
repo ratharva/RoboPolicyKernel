@@ -94,6 +94,18 @@ def _load_base_run_config(config_file: str | None) -> RunConfig:
 
 
 def main() -> None:
+    # Real wall-clock phase timing -- prints "(Xs)" next to each major
+    # section marker below, so a slow run's startup can be attributed to a
+    # specific phase (Ray connect, dataset build, ...) instead of only
+    # knowing the total time-to-first-training-step after the fact.
+    _phase_start = time.time()
+
+    def _mark_phase(label: str) -> None:
+        nonlocal _phase_start
+        now = time.time()
+        print(f"  ({label} took {now - _phase_start:.1f}s)")
+        _phase_start = now
+
     # Checked before parser.parse_args() (and before --tasks/--policy-type,
     # both required=True below, would reject a bare invocation) so this
     # works as a standalone, no-other-flags-needed discovery command --
@@ -133,6 +145,9 @@ def main() -> None:
                          help="gradient accumulation steps")
     parser.add_argument("--weight-decay", type=float, default=1e-4,
                          help="AdamW weight decay")
+    parser.add_argument("--adam-beta1", type=float, default=None, help="AdamW beta1 (default: config value or 0.9)")
+    parser.add_argument("--adam-beta2", type=float, default=None, help="AdamW beta2 (default: config value or 0.999)")
+    parser.add_argument("--adam-eps", type=float, default=None, help="AdamW eps (default: config value or 1e-8)")
     parser.add_argument("--max-train-steps", type=int, default=None,
                          help="cap total steps for a smoke run; omit for a full run over the data")
     parser.add_argument("--window-every-steps", type=int, default=200,
@@ -153,6 +168,17 @@ def main() -> None:
                               "close to wherever training actually stopped), even when the most "
                               "recent isn't among the N best -- native Ray Train checkpoint-manager "
                               "behavior, not custom logic here")
+    parser.add_argument("--async-checkpoint", action="store_true",
+                         help="copy model/optimizer state to CPU synchronously (fast), then write it "
+                              "via pickle.dump in a background thread while training continues, "
+                              "instead of blocking the training loop for the full write duration. "
+                              "Opt-in, plain-DDP path only (no effect under "
+                              "--molmoact2-distributed-strategy/--pi05-distributed-strategy fsdp2, "
+                              "which already use accelerate's own save_state/load_state). Carries "
+                              "real, not-fully-verified risk: a save is only reported to Ray -- "
+                              "eligible for checkpoint retention/resume -- one checkpoint-cycle late, once its "
+                              "write is confirmed finished. Test with a real crash+resume before "
+                              "trusting this for a long run")
     parser.add_argument("--num-workers", type=int, default=None,
                          help="Ray Train DDP workers; default = live GPU count")
 
@@ -287,6 +313,28 @@ def main() -> None:
                          help="action component names to keep absolute even under "
                               "--action-representation delta (e.g. a gripper component name)")
 
+    # --- STATE/ACTION normalization mode+stats resolution (training/model/normalization.py) ---
+    parser.add_argument("--normalization-mode-source", choices=("explicit", "checkpoint"), default="explicit",
+                         help="explicit (default): use --normalization-explicit-mode, or the policy's own "
+                              "hardcoded default if unset. checkpoint: read the mode from the pretrained "
+                              "checkpoint's own saved config -- requires adapter support (pi05 only)")
+    parser.add_argument("--normalization-explicit-mode",
+                         choices=("MEAN_STD", "MIN_MAX", "QUANTILES", "QUANTILE10", "IDENTITY"), default=None,
+                         help="only used with --normalization-mode-source explicit -- overrides the "
+                              "policy's own hardcoded STATE/ACTION mode. None: no override")
+    parser.add_argument("--normalization-stats-source", choices=("dataset", "checkpoint", "explicit_file"),
+                         default="dataset",
+                         help="dataset (default): compute from this run's own training data. checkpoint: "
+                              "use numeric stats the checkpoint itself publishes (errors if it publishes "
+                              "none). explicit_file: load a pre-computed stats JSON")
+    parser.add_argument("--normalization-explicit-stats-file", default=None,
+                         help='required iff --normalization-stats-source explicit_file -- path to a JSON '
+                              'file shaped like {"observation.state": {...}, "action": {...}}')
+    parser.add_argument("--inspect-normalization", action="store_true",
+                         help="print the active policy's pretrained checkpoint's declared normalization "
+                              "vs. this run's resolved settings, then exit -- no training-data access, "
+                              "no TorchTrainer launched")
+
     # --- per-camera image normalization ---
     parser.add_argument("--image-normalization", nargs="+", default=[],
                          metavar="CAMERA=MODE",
@@ -305,7 +353,7 @@ def main() -> None:
     parser.add_argument("--policy-type", choices=("act", "molmoact2", "pi05"), required=True,
                          help="which policy family to train -- act (this repo's original "
                               "lightweight policy, trains from random init), molmoact2 (~8B-param VLA), "
-                              "or pi05 (~2.3B-param VLA, needs --pi05-pretrained-path) -- all three "
+                              "or pi05 (~3.2-3.3B-param VLA, needs --pi05-pretrained-path) -- all three "
                               "share the same lerobot install, see README")
     parser.add_argument("--molmoact2-checkpoint-path", default="allenai/MolmoAct2",
                          help="HF repo id or local path MolmoAct2's VLM backbone loads from")
@@ -365,6 +413,17 @@ def main() -> None:
                               "modeling_molmoact2.py) -- bfloat16 is MolmoAct2Config's own real default "
                               "already, so this pipeline was already getting that benefit; exposed here "
                               "as a real override (e.g. float32 to debug a numerics issue)")
+    parser.add_argument("--molmoact2-revision", default=None,
+                         help="pins weight loading to a specific Hub revision/commit/tag -- default: "
+                              "the Hub's latest")
+    parser.add_argument("--molmoact2-norm-tag", default=None,
+                         help="selects a real, checkpoint-published normalization/config tag (e.g. "
+                              "'franka_droid') from the checkpoint's own norm_stats.json -- explicit "
+                              "only, no auto-derivation from --dataset-source (the mapping isn't 1:1). "
+                              "Warning: MolmoAct2Policy's own _apply_norm_tag_metadata silently "
+                              "overwrites chunk_size/n_action_steps to the tag's values at construction "
+                              "time -- validate_normalization hard-fails if these don't already match "
+                              "what you configured")
 
     # --- pi05 ---
     parser.add_argument("--pi05-pretrained-path", default="",
@@ -396,6 +455,40 @@ def main() -> None:
                               "that same class's own real default and gets real speedup on H100/A100 "
                               "tensor cores -- PI05Config itself defaults to float32, so this pipeline "
                               "previously never set this at all, silently training in full float32")
+    parser.add_argument("--pi05-distributed-strategy", choices=("ddp", "fsdp2"), default="ddp",
+                         help="ddp (default): plain DDP via ray.train.torch.prepare_model. fsdp2: "
+                              "accelerate-driven FSDP2 sharding inside the Ray Train worker -- unlike "
+                              "MolmoAct2, usable with any --pi05-freeze-vision-encoder/"
+                              "--pi05-train-expert-only combination (PI05 has no LoRA to already "
+                              "solve memory) -- see README's FSDP2 section before using this, it "
+                              "carries real unverified checkpoint-resume risk")
+    parser.add_argument("--pi05-fsdp-cpu-offload", action="store_true",
+                         help="trades speed for fitting on fewer/smaller GPUs -- fsdp2 strategy only")
+
+    # --- pi05 speed flags (see training/README.md's "π0.5 training speed") ---
+    parser.add_argument("--pi05-compile-model", action="store_true",
+                         help="Recommended: 0.46s vs 1.12s perf/compute_s. Use with --pi05-compile-mode "
+                              "default or reduce-overhead, not the field's own 'max-autotune' default -- "
+                              "that has a severe warmup cost")
+    parser.add_argument("--pi05-compile-mode", default="max-autotune",
+                         help="only used with --pi05-compile-model -- torch.compile's mode string. "
+                              "PI05Config's own default ('max-autotune') is not recommended here; pass "
+                              "'default' or 'reduce-overhead' explicitly")
+    parser.add_argument("--pi05-vision-bf16", action="store_true",
+                         help="Recommended: 0.60s vs 1.12s perf/compute_s alone, 0.35s combined with "
+                              "--pi05-compile-model. Monkey-patches the constructed model to cast "
+                              "vision_tower/multi_modal_projector to bf16 -- not a supported lerobot "
+                              "option, not yet confirmed stable over a long training run")
+    parser.add_argument("--pi05-narrow-checkpoint", action="store_true",
+                         help="Tested, no measured speed effect -- kept as a documented dead end. "
+                              "Monkey-patches lerobot's _apply_checkpoint to skip checkpointing the "
+                              "action_out_proj layer specifically")
+    parser.add_argument("--pi05-print-attn-impl", action="store_true",
+                         help="diagnostic only, zero risk -- prints the real attn_implementation used "
+                              "during training (confirmed 'sdpa', not 'eager')")
+    parser.add_argument("--pi05-revision", default=None,
+                         help="pins both weight loading and normalization-config loading to a specific "
+                              "Hub revision/commit/tag -- default: the Hub's latest")
     args = parser.parse_args()
 
     # Policy-specific "required iff"/cross-field validation moved below,
@@ -445,6 +538,18 @@ def main() -> None:
     _apply_if_explicit(run_cfg.train, "lr_backbone", args, "lr_backbone", parser)
     _apply_if_explicit(run_cfg.train, "grad_accum", args, "grad_accum", parser)
     _apply_if_explicit(run_cfg.train, "weight_decay", args, "weight_decay", parser)
+    # Merge each supplied component; None distinguishes omission from an
+    # explicit value equal to the usual AdamW default.
+    run_cfg.train.adam_betas = tuple(
+        configured if override is None else override
+        for configured, override in zip(run_cfg.train.adam_betas, (args.adam_beta1, args.adam_beta2))
+    )
+    # None-sentinel merge, not _apply_if_explicit -- adam_eps's own natural
+    # default (1e-8) is a real, legitimate value a user might explicitly
+    # pass, which _apply_if_explicit's "differs from parser default" check
+    # can't distinguish from having passed nothing at all.
+    if args.adam_eps is not None:
+        run_cfg.train.adam_eps = args.adam_eps
     _apply_if_explicit(run_cfg.train, "max_train_steps", args, "max_train_steps", parser)
     _apply_if_explicit(run_cfg.train, "window_every_steps", args, "window_every_steps", parser)
     if run_cfg.train.window_every_steps <= 0:
@@ -455,6 +560,7 @@ def main() -> None:
     )
     _apply_if_explicit(run_cfg.train, "save_only_on_improvement", args, "save_only_on_improvement", parser)
     _apply_if_explicit(run_cfg.train, "checkpoint_max_to_keep", args, "checkpoint_max_to_keep", parser)
+    _apply_if_explicit(run_cfg.train, "async_checkpoint", args, "async_checkpoint", parser)
     _apply_if_explicit(run_cfg.train, "log_perf_metrics", args, "log_perf_metrics", parser)
     if args.profile_steps is not None:  # already parsed into the (start, end) tuple `profile_steps` above
         run_cfg.train.profile_steps = profile_steps
@@ -549,6 +655,8 @@ def main() -> None:
     if run_cfg.policy_type == "molmoact2":
         m = run_cfg.model
         _apply_if_explicit(m, "checkpoint_path", args, "molmoact2_checkpoint_path", parser)
+        _apply_if_explicit(m, "revision", args, "molmoact2_revision", parser)
+        _apply_if_explicit(m, "norm_tag", args, "molmoact2_norm_tag", parser)
         _apply_if_explicit(m, "setup_type", args, "molmoact2_setup_type", parser)
         _apply_if_explicit(m, "control_mode", args, "molmoact2_control_mode", parser)
         _apply_if_explicit(m, "action_mode", args, "molmoact2_action_mode", parser)
@@ -580,11 +688,37 @@ def main() -> None:
         _apply_if_explicit(m, "gradient_checkpointing", args, "pi05_gradient_checkpointing", parser)
         _apply_if_explicit(m, "empty_cameras", args, "pi05_empty_cameras", parser)
         _apply_if_explicit(m, "dtype", args, "pi05_dtype", parser)
+        _apply_if_explicit(m, "distributed_strategy", args, "pi05_distributed_strategy", parser)
+        _apply_if_explicit(m, "fsdp_cpu_offload", args, "pi05_fsdp_cpu_offload", parser)
+        _apply_if_explicit(m, "revision", args, "pi05_revision", parser)
+        _apply_if_explicit(m, "compile_model", args, "pi05_compile_model", parser)
+        _apply_if_explicit(m, "compile_mode", args, "pi05_compile_mode", parser)
+        _apply_if_explicit(m, "vision_bf16", args, "pi05_vision_bf16", parser)
+        _apply_if_explicit(m, "narrow_checkpoint", args, "pi05_narrow_checkpoint", parser)
+        _apply_if_explicit(m, "print_attn_impl", args, "pi05_print_attn_impl", parser)
+        # No fsdp2-requires-X restriction here (unlike MolmoAct2's fsdp2-
+        # requires-train_mode-fft check): PI05 has no LoRA, so FSDP2's
+        # memory-sharding benefit applies regardless of
+        # freeze_vision_encoder/train_expert_only.
         if not m.pretrained_path:
             parser.error(
                 "--pi05-pretrained-path is required when --policy-type pi05 (either as a CLI flag or "
                 "in --config-file's model section)"
             )
+
+    # --- image-normalization default: an adapter's preferred_visual_normalization
+    # (e.g. pi05's "unit01") wins over DataConfig.default_image_normalization's
+    # own default ("mean_std") unless --image-normalization-default was
+    # explicitly passed -- the _apply_if_explicit call below still overrides
+    # this if the user actually passed the flag.
+    from training.model.registry import get_adapter
+
+    adapter = get_adapter(run_cfg.policy_type)
+    if (
+        adapter.preferred_visual_normalization
+        and args.image_normalization_default == parser.get_default("image_normalization_default")
+    ):
+        run_cfg.data.default_image_normalization = adapter.preferred_visual_normalization
 
     # --- data: action-space/image-normalization -- CLI wins per-key for the
     # two dict fields (a config-file's other camera entries are preserved,
@@ -601,6 +735,17 @@ def main() -> None:
     if run_cfg.data.action_representation not in ("absolute", "delta"):
         parser.error("action representation must be 'absolute' or 'delta'")
     _apply_if_explicit(run_cfg.data, "action_delta_exclude", args, "action_delta_exclude", parser)
+
+    _apply_if_explicit(run_cfg.data.normalization, "mode_source", args, "normalization_mode_source", parser)
+    _apply_if_explicit(run_cfg.data.normalization, "explicit_mode", args, "normalization_explicit_mode", parser)
+    _apply_if_explicit(run_cfg.data.normalization, "stats_source", args, "normalization_stats_source", parser)
+    _apply_if_explicit(
+        run_cfg.data.normalization, "explicit_stats_file", args, "normalization_explicit_stats_file", parser,
+    )
+    if run_cfg.data.normalization.mode_source not in ("explicit", "checkpoint"):
+        parser.error("normalization mode_source must be 'explicit' or 'checkpoint'")
+    if run_cfg.data.normalization.stats_source not in ("dataset", "checkpoint", "explicit_file"):
+        parser.error("normalization stats_source must be 'dataset', 'checkpoint', or 'explicit_file'")
 
     _apply_if_explicit(run_cfg, "storage_root", args, "storage_root", parser)
     run_cfg.storage_root = os.path.abspath(run_cfg.storage_root)
@@ -637,6 +782,37 @@ def main() -> None:
         )
     run_cfg.data.robot = original_robot.select_action_space(run_cfg.data.action_space)
 
+    if args.inspect_normalization:
+        from training.model.normalization import inspect_pretrained_normalization
+
+        print(f"\n=== normalization inspection ({run_cfg.policy_type}) ===")
+        pretrained = inspect_pretrained_normalization(run_cfg.policy_type, run_cfg.model)
+        if pretrained is None:
+            print(
+                f"  policy_type={run_cfg.policy_type!r} has no get_pretrained_normalization hook -- "
+                "nothing to inspect for this policy."
+            )
+        else:
+            print(f"  checkpoint declared mode: {pretrained.mode}")
+            print(
+                f"  checkpoint publishes numeric stats: {'yes' if pretrained.stats else 'no'} "
+                f"({sorted(pretrained.stats) if pretrained.stats else '[]'})"
+            )
+            print(
+                f"  checkpoint action_relative={pretrained.action_relative} "
+                f"exclude={pretrained.action_relative_exclude} vs. this run's "
+                f"--action-representation {run_cfg.data.action_representation!r} "
+                f"--action-delta-exclude {run_cfg.data.action_delta_exclude!r}"
+            )
+            print(
+                f"  checkpoint max_state_dim={pretrained.max_state_dim} "
+                f"max_action_dim={pretrained.max_action_dim} (padded capacity, not per-dataset dims) "
+                f"vs. this run's RobotSchema state_dim={run_cfg.data.robot.state_dim} "
+                f"action_dim={run_cfg.data.robot.action_dim}"
+            )
+        print(f"  resolved default image-normalization mode: {run_cfg.data.default_image_normalization!r}")
+        return
+
     for cam, mode in run_cfg.data.image_normalization.items():
         if mode not in IMAGE_NORMALIZATION_MODES:
             raise SystemExit(f"image-normalization {cam}={mode}: unknown mode, must be one of {IMAGE_NORMALIZATION_MODES}")
@@ -667,10 +843,12 @@ def main() -> None:
             "max_episodes_per_task", run_cfg.max_episodes_per_task
         )
 
+    _mark_phase("argument parsing / config resolution")
     print("\n=== connect to Ray ===")
     connect_ray(build_runtime_env(storage_root=run_cfg.storage_root))
     print("  Data tab   -> per-operator throughput / object-store memory while decoding")
     print("  Jobs/Train -> per-worker status and the loss + policy-specific metrics reported below")
+    _mark_phase("Ray connect")
 
     ray.data.DataContext.get_current().enable_rich_progress_bars = True
     ray.data.DataContext.get_current().use_ray_tqdm = False
@@ -811,6 +989,7 @@ def main() -> None:
         test_raw_ds, test_episode_indices = _resolve_side_v3_root("test", args.test_v3_root)
         print(f"  test split: {len(test_episode_indices)} episode(s) from separate --test-v3-root {args.test_v3_root}")
 
+    _mark_phase("build Ray Data pipeline (from LeRobot v3)")
     print("\n=== compute normalization stats ===")
     # Sampled from raw_ds (pre-transpose, HWC), AFTER action-space selection/
     # delta-conversion/val-test-split above -- so stats reflect whatever's
@@ -821,6 +1000,21 @@ def main() -> None:
     # val/test -- that data was never part of raw_ds to begin with. See
     # training/data/stats.py.
     dataset_stats = compute_dataset_stats(raw_ds, run_cfg.data)
+
+    # STATE/ACTION normalization mode+stats resolution -- no-op when
+    # run_cfg.data.normalization is left at its defaults. See
+    # training/model/normalization.py.
+    from training.model.normalization import resolve_normalization, validate_normalization
+
+    resolved_normalization = resolve_normalization(run_cfg.data, run_cfg.policy_type, run_cfg.model, raw_ds)
+    validate_normalization(
+        resolved_normalization, run_cfg.data, run_cfg.data.robot, run_cfg.policy_type, run_cfg.model,
+    )
+    if resolved_normalization.stats:
+        for key, val in resolved_normalization.stats.items():
+            dataset_stats[key] = val
+    if resolved_normalization.mode is not None:
+        run_cfg.model.resolved_normalization_mode = resolved_normalization.mode
 
     ds = transpose_for_training(
         raw_ds, run_cfg.data.robot.camera_keys, name=run_cfg.run_name,
@@ -877,6 +1071,7 @@ def main() -> None:
     if test_ds is not None:
         datasets["test"] = test_ds
 
+    _mark_phase("normalization stats / preprocessing setup")
     print(f"\n=== launch Ray Train: {run_cfg.run_name} ===")
     trainer = ray.train.torch.TorchTrainer(
         train_loop_per_worker=train_loop_per_worker,
@@ -910,6 +1105,7 @@ def main() -> None:
         ),
         datasets=datasets,
     )
+    _mark_phase("TorchTrainer construction")
     try:
         result = trainer.fit()
     except Exception as e:

@@ -6,9 +6,6 @@ environment as ACT -- no fork or separate environment needed.
 """
 from __future__ import annotations
 
-import json
-import os
-
 import torch
 
 from training.common.config import DataConfig
@@ -87,6 +84,8 @@ def build_molmoact2_config(
         output_features=output_features,
         device=device,
         checkpoint_path=overrides.checkpoint_path,
+        checkpoint_revision=overrides.revision,
+        norm_tag=overrides.norm_tag,
         chunk_size=overrides.chunk_size,
         n_action_steps=overrides.n_action_steps,
         action_mode=overrides.action_mode,
@@ -103,14 +102,14 @@ def build_molmoact2_config(
         image_keys=image_keys,
         setup_type=overrides.setup_type,
         control_mode=overrides.control_mode,
-        # STATE/ACTION: MEAN_STD (not the real default IDENTITY/QUANTILES) so
-        # training/data/stats.py's mean/std-only compute_dataset_stats works
-        # unchanged. VISUAL: IDENTITY -- training/model/image_normalization.py
-        # now owns all image scaling instead (applied in train_loop.py/
-        # offload_molmoact2_preprocessing before this policy's preprocessor
-        # runs), so lerobot's own per-FeatureType normalizer must not also
-        # scale images.
-        normalization_mapping={"VISUAL": "IDENTITY", "STATE": "MEAN_STD", "ACTION": "MEAN_STD"},
+        # STATE/ACTION: MEAN_STD by default, overridden to the checkpoint's
+        # own scheme when overrides.resolved_normalization_mode is set by
+        # training/model/normalization.py's resolve_normalization
+        # (--normalization-mode-source checkpoint). VISUAL: always IDENTITY
+        # -- training/model/image_normalization.py owns image scaling instead.
+        normalization_mapping=overrides.resolved_normalization_mode or {
+            "VISUAL": "IDENTITY", "STATE": "MEAN_STD", "ACTION": "MEAN_STD",
+        },
         optimizer_lr=train_cfg.lr,
         optimizer_vit_lr=overrides.optimizer_vit_lr or train_cfg.lr,
         optimizer_connector_lr=overrides.optimizer_connector_lr or train_cfg.lr,
@@ -143,6 +142,88 @@ def build_policy_and_processor(
 def forward_loss(policy, inputs: dict) -> tuple[torch.Tensor, dict[str, float]]:
     loss, metrics = policy(inputs)
     return loss, {k: float(v) for k, v in metrics.items()}
+
+
+def _fetch_norm_stats_doc(checkpoint_path: str, revision: str | None) -> dict:
+    """Reads the checkpoint's own norm_stats.json in full (a bespoke
+    MolmoAct2 format -- NOT lerobot's generic DataProcessorPipeline save
+    format pi05 uses). Returns {} (never raises) if missing/unparseable."""
+    import json
+    import os
+
+    filename = "norm_stats.json"
+    if os.path.isdir(checkpoint_path):
+        path = os.path.join(checkpoint_path, filename)
+        if not os.path.exists(path):
+            return {}
+    else:
+        from huggingface_hub import hf_hub_download
+
+        try:
+            path = hf_hub_download(repo_id=checkpoint_path, filename=filename, revision=revision)
+        except Exception:
+            return {}
+
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def get_norm_tag_metadata(checkpoint_path: str, revision: str | None, norm_tag: str | None) -> dict:
+    """The checkpoint's own raw metadata_by_tag[norm_tag] entry -- used both
+    by get_pretrained_normalization below and by
+    training/model/normalization.py's validation guard (chunk_size/
+    n_action_steps: MolmoAct2Policy's own _apply_norm_tag_metadata silently
+    overwrites these from this same metadata at construction time)."""
+    norm_tag = (norm_tag or "").strip()
+    if not norm_tag:
+        return {}
+    doc = _fetch_norm_stats_doc(checkpoint_path, revision)
+    metadata = (doc.get("metadata_by_tag") or {}).get(norm_tag)
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def fetch_molmoact2_norm_stats(checkpoint_path: str, revision: str | None, norm_tag: str | None) -> dict:
+    """{"observation.state": {...}, "action": {...}} from the checkpoint's
+    own norm_tag metadata -- real keys already include "q01"/"q99" etc.
+    (confirmed against the real checkpoint), so no remapping is needed."""
+    metadata = get_norm_tag_metadata(checkpoint_path, revision, norm_tag)
+
+    def numeric(d):
+        return {k: v for k, v in (d or {}).items() if k not in ("names", "mask")}
+
+    stats: dict = {}
+    if isinstance(metadata.get("state_stats"), dict):
+        stats["observation.state"] = numeric(metadata["state_stats"])
+    if isinstance(metadata.get("action_stats"), dict):
+        stats["action"] = numeric(metadata["action_stats"])
+    return stats
+
+
+def get_pretrained_normalization(overrides: MolmoAct2ConfigOverrides):
+    """PolicyAdapter.get_pretrained_normalization hook. Unlike pi05's
+    PI05Config.from_pretrained-based implementation, MolmoAct2Config.
+    from_pretrained fails against the real checkpoint (its config.json has
+    no lerobot 'type' discriminator field -- confirmed live) -- so `mode`
+    below is the real, installed MolmoAct2Config()'s own dataclass default
+    (STATE/ACTION: QUANTILES, VISUAL: IDENTITY), not read from the
+    checkpoint's saved config. Numeric stats, when overrides.norm_tag is
+    set, come from the checkpoint's own bespoke norm_stats.json."""
+    from training.model.normalization import PretrainedNormalization
+
+    mode = {"VISUAL": "IDENTITY", "STATE": "QUANTILES", "ACTION": "QUANTILES"}
+    stats = fetch_molmoact2_norm_stats(overrides.checkpoint_path, overrides.revision, overrides.norm_tag)
+    return PretrainedNormalization(
+        mode=mode,
+        stats=stats,
+        action_relative=False,   # no use_relative_actions-equivalent field exists in MolmoAct2Config
+        action_relative_exclude=[],
+        max_state_dim=None,       # no padded-capacity ceiling like PI05Config's max_state_dim/max_action_dim
+        max_action_dim=None,
+        revision=overrides.revision,
+    )
 
 
 def enable_training_optimizations(policy, overrides: MolmoAct2ConfigOverrides) -> None:
@@ -200,20 +281,7 @@ def wrap_for_training(policy, optimizer, overrides: MolmoAct2ConfigOverrides, de
     return policy, optimizer, accelerator
 
 
-def save_checkpoint(accelerator, out_dir: str, epoch: int, step: int, epoch_complete: bool) -> None:
-    """Every rank must call this -- FSDP2-sharded save needs all ranks'
-    shards, unlike ACT's rank-0-only pickle save.
-
-    epoch_complete distinguishes a step-windowed (mid-epoch) checkpoint from
-    an end-of-epoch one; train_loop.py's resume logic needs this to compute
-    the correct start_epoch."""
-    accelerator.save_state(out_dir)
-    if accelerator.is_main_process:
-        with open(os.path.join(out_dir, "meta.json"), "w") as f:
-            json.dump({"epoch": epoch, "step": step, "epoch_complete": epoch_complete}, f)
-
-
-def load_checkpoint(accelerator, in_dir: str) -> dict:
-    accelerator.load_state(in_dir)
-    with open(os.path.join(in_dir, "meta.json")) as f:
-        return json.load(f)
+# save_checkpoint/load_checkpoint: fully generic over accelerator/paths,
+# no MolmoAct2-specific logic -- shared with pi05.py's own FSDP2 path
+# instead of duplicated.
+from training.model.fsdp2_checkpoint import load_checkpoint, save_checkpoint  # noqa: E402,F401

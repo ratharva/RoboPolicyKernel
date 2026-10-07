@@ -1,0 +1,37 @@
+# --config-file for the specific droid_100 / pi05 / 2xH100 run discussed in
+# chat: --max-train-steps 1000, --val-every-steps 100, --log-perf-metrics,
+# --val-split-fraction 0.2. Based on pi05_droid.yaml (see that file for why
+# chunk_size/n_action_steps=15 -- must match lerobot/pi05_droid's own
+# config.json, not this pipeline's default of 50).
+#
+# --tasks/--policy-type/--dataset-source/--num-workers are NOT settable via
+# this file -- --tasks/--policy-type are always required on the command
+# line (see training/README.md's "Config files" section), and
+# --dataset-source/--num-workers are read straight from CLI args even when
+# a --config-file is given (confirmed directly against train.py -- neither
+# is merged into run_cfg), so all four must still be passed explicitly:
+#
+#   python -m training.train --tasks droid_100 --dataset-source droid_100 \
+#       --policy-type pi05 --config-file training/configs/pi05_droid100_2xh100_run.yaml \
+#       --num-workers 2 --run-name pi05-droid100-2xh100
+
+train:
+  num_epochs: 5
+  batch_size: 8
+  window_every_steps: 200
+  max_train_steps: 1000
+
+  log_perf_metrics: true
+
+  val_split_fraction: 0.2
+  val_every_steps: 100
+
+model:
+  type: pi05
+  pretrained_path: lerobot/pi05_droid
+  chunk_size: 15
+  n_action_steps: 15
+  freeze_vision_encoder: false
+  train_expert_only: false
+  gradient_checkpointing: true
+  empty_cameras: 0

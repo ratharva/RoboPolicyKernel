@@ -7,8 +7,7 @@ import ray
 
 
 def _quiet_placement_group_cleaner() -> None:
-    """worker_process_setup_hook -- runs once per Ray worker process at
-    startup. Filters out ONLY PlacementGroupCleaner's benign, high-frequency
+    """Filters out ONLY PlacementGroupCleaner's benign, high-frequency
     "State API may be temporarily unavailable" message (a periodic health-
     check retry, not a real problem) -- NOT a setLevel(ERROR) on the whole
     logger, which would also hide its other real warnings (cleanup failure,
@@ -24,6 +23,41 @@ def _quiet_placement_group_cleaner() -> None:
     logging.getLogger(
         "ray.train.v2._internal.execution.controller.placement_group_cleaner"
     ).addFilter(_TransientStateApiWarningFilter())
+
+
+def _default_nccl_env() -> None:
+    """Sets a few NCCL env vars directly in THIS worker process's own
+    os.environ (only if not already present) -- a real, reproduced case
+    showed `runtime_env`'s `env_vars` (passed to ray.init()) did NOT
+    reliably reach the actual NCCL init call inside a Ray Train worker
+    (same NVLS CUDA error persisted with env_vars set both ways: neither a
+    shell `export` before launching, nor forwarding it through
+    build_runtime_env's own env_vars, changed anything). Setting it here,
+    directly via os.environ in a worker_process_setup_hook callable that's
+    already confirmed to run inside the actual worker process (see
+    _quiet_placement_group_cleaner above), is unambiguous: NCCL reads env
+    vars via plain getenv() at ITS OWN init time, which happens well after
+    this hook runs, so this is guaranteed to be visible to it regardless
+    of whatever the runtime_env/ray.init() layer does or doesn't forward.
+
+    Disables NVLink SHARP (NVLS) multicast and P2P -- real, reproduced
+    fix for a shared/virtualized multi-GPU instance whose NVSwitch fabric
+    isn't fully exposed to the container: `NCCL error ... Failed to bind
+    NVLink SHARP (NVLS) Multicast memory ... CUDA error 401`. Bounded
+    downside on a healthy/bare-metal multi-GPU box (somewhat less optimal
+    collective-communication bandwidth, not a correctness issue), so this
+    is a safe default rather than something requiring opt-in -- setdefault
+    means an explicit, already-working override still wins over this."""
+    os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
+    os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+
+
+def _worker_process_setup() -> None:
+    """The actual worker_process_setup_hook passed to Ray -- combines
+    every per-worker-process startup action this project needs. Runs once
+    per Ray worker process at startup, confirmed via a real local test."""
+    _quiet_placement_group_cleaner()
+    _default_nccl_env()
 
 
 def build_runtime_env(storage_root: str | None = None) -> dict:
@@ -47,9 +81,18 @@ def build_runtime_env(storage_root: str | None = None) -> dict:
             rel = None  # e.g. different drive on Windows
         if rel and not rel.startswith(".."):
             excludes.append(f"{rel}/**")
+
+    # Also forward any NCCL_* var already in THIS (driver) process's
+    # environment -- belt-and-suspenders alongside _default_nccl_env's
+    # direct os.environ.setdefault() in the worker_process_setup_hook
+    # below (that one is the confirmed-effective mechanism; this one is
+    # cheap to include too in case a future Ray version does forward it).
+    env_vars = {k: v for k, v in os.environ.items() if k.startswith("NCCL_")}
+
     return {
         "working_dir": ".", "excludes": excludes,
-        "worker_process_setup_hook": _quiet_placement_group_cleaner,
+        "worker_process_setup_hook": _worker_process_setup,
+        "env_vars": env_vars,
     }
 
 

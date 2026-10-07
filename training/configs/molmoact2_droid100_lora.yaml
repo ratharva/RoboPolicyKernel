@@ -1,0 +1,38 @@
+# LoRA variant of molmoact2_droid100_base.yaml -- for anyone without
+# FSDP2-capable multi-GPU hardware for the full-finetune path AllenAI's own
+# recipe actually recommends. Same normalization fix, same checkpoint
+# prompts/chunk_size, AllenAI's real LoRA-recipe learning rates instead
+# (all three non-action-expert groups at 5e-5, vs. full-finetune's smaller
+# vit/connector rates -- see training/README.md).
+#
+#   python -m training.train --tasks droid_100_test --dataset-source droid_100 \
+#       --policy-type molmoact2 --config-file training/configs/molmoact2_droid100_lora.yaml
+#
+# --tasks/--policy-type are still required on the command line. Pass
+# --lr 5e-5 to match AllenAI's real LoRA recipe for the llm group too.
+
+train:
+  batch_size: 8
+  window_every_steps: 200
+  weight_decay: 0.0
+  adam_betas: [0.9, 0.95]
+  adam_eps: 1.0e-6
+
+model:
+  type: molmoact2
+  setup_type: "single franka robotic arm in droid"
+  control_mode: "absolute joint pose"
+  chunk_size: 15
+  n_action_steps: 15
+  train_mode: lora            # this pipeline's own default -- fits on one GPU
+  gradient_checkpointing: true
+  # AllenAI's real LoRA-recipe learning rates -- all three at 5e-5, unlike
+  # the full-finetune recipe's smaller vit/connector rates.
+  optimizer_vit_lr: 5.0e-5
+  optimizer_connector_lr: 5.0e-5
+  optimizer_action_expert_lr: 5.0e-5
+
+data:
+  normalization:
+    mode_source: checkpoint
+    stats_source: dataset

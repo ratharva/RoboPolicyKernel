@@ -199,8 +199,12 @@ flag reference.
 
 `--policy-type pi05` trains lerobot's `PI05Policy` -- a PaliGemma-based VLM
 backbone (`gemma_2b`) + a separate, smaller flow-matching action expert
-(`gemma_300m`), roughly ~2.3B params total by variant naming, well below
-MolmoAct2's ~8B. Same environment as ACT/MolmoAct2, no separate install.
+(`gemma_300m`), **~3.2-3.3B params total** (corrected from an earlier
+"~2.3B" estimate here -- confirmed by reading the real installed
+`lerobot==0.6.1` source's actual layer dims: gemma_2b VLM ≈2.0B + vocab
+embed ≈0.5B, gemma_300m action-expert ≈0.3B, SigLIP so400m vision tower
+≈0.4B), still well below MolmoAct2's ~8B. Same environment as
+ACT/MolmoAct2, no separate install.
 
 Unlike ACT (trains from random init in this pipeline) and MolmoAct2 (loads
 its own weights internally via a `checkpoint_path` config field), π0.5 is
@@ -257,19 +261,55 @@ PI05Policy.__dict__`) -- freezing is via `requires_grad` only. Unverified:
 whether any train/eval-sensitive layers (e.g. dropout) exist in the frozen
 submodules such that this matters.
 
-### DDP only -- no FSDP2
+### FSDP2 (optional) -- same accelerate-based pattern as MolmoAct2
 
-MolmoAct2's FSDP2 support was justified by its real ~60GB/GPU full-finetune
-numbers; no equivalent real VRAM number exists for π0.5 (no real
-forward/backward pass has been run -- see above), so fabricating one to
-justify building FSDP2 upfront would be exactly the kind of unverified claim
-this project's discipline pushes back on. All three π0.5 training modes
-(full fine-tune, freeze-vision, expert-only) use plain DDP
-(`ray.train.torch.prepare_model`, same mechanism ACT uses,
-`find_unused_parameters=True` as the same cheap defensive insurance
-MolmoAct2's DDP path uses). If a real run later shows DDP doesn't fit
-π0.5's ~2.3B params, extending to FSDP2 is a mechanical repeat of
-`model/molmoact2.py`'s pattern, not new design work.
+`--pi05-distributed-strategy fsdp2` uses the same accelerate/FSDP2
+mechanism as MolmoAct2's (`training/model/pi05.py`'s `wrap_for_training`),
+with two real differences worth knowing:
+
+- **Wrap-class names**: `transformer_cls_names_to_wrap = ["_PiGemmaDecoderLayerBase",
+  "SiglipEncoderLayer"]`. Unlike MolmoAct2 (two mutually-exclusive decoder-
+  layer variants depending on a config flag), PI05's PaliGemma VLM
+  (`language_model`) and its separately-instantiated `gemma_expert.model`
+  are BOTH built by the same locally-scoped factory function
+  (`lerobot/policies/pi05/pi_gemma.py`'s `_get_pi_gemma_decoder_layer_base`,
+  confirmed by reading the real installed source) -- different Python
+  class objects per call, but `type(m).__name__` is identical for both, so
+  one name covers both sub-models automatically. No mutual-exclusivity
+  filtering needed the way MolmoAct2's does; the same defensive
+  present-classes intersection pattern is still used regardless, in case
+  a future lerobot version renames these.
+- **No `mixed_precision` kwarg**: MolmoAct2's `wrap_for_training` hardcodes
+  `Accelerator(mixed_precision="bf16")`. PI05's does NOT do this -- PI05
+  already applies its own mixed bf16/fp32 per-param cast
+  (`PaliGemmaWithExpertModel.to_bfloat16_for_selected_params`, keeping
+  `vision_tower`/`multi_modal_projector`/layernorms in float32 for
+  stability) at construction time, before `wrap_for_training` ever runs.
+  Passing `mixed_precision="bf16"` too would blanket-recast everything
+  back to bf16 and silently undo that split.
+
+Unlike MolmoAct2 (where fsdp2 is restricted to `train_mode=="fft"` since
+LoRA already solves memory and mixing LoRA-adapter-plus-frozen-base under
+FSDP2 has known complications), PI05's fsdp2 is **not** restricted to any
+particular `--pi05-freeze-vision-encoder`/`--pi05-train-expert-only`
+combination -- PI05 has no LoRA, and DDP always fully replicates the whole
+model regardless of what's frozen, so FSDP2's memory-sharding benefit
+applies to every PI05 training mode.
+
+**Not yet verified** (no GPU-capable dev environment available where this
+was written): that the fp32-designated params actually survive
+`accelerator.prepare()` still showing `dtype=torch.float32` in
+`named_parameters()` (rather than FSDP2 silently unifying dtype per wrap
+unit), that mixing fp32 layernorms with bf16 attention/MLP inside the same
+`_PiGemmaDecoderLayerBase`-wrapped unit doesn't break FSDP2's flat-
+parameter sharding, and the crash+resume behavior (same
+`save_checkpoint`/`load_checkpoint` -- now factored into a shared
+`training/model/fsdp2_checkpoint.py` module both MolmoAct2 and PI05
+import -- as MolmoAct2's own verified-live FSDP2 checkpointing above,
+same `accelerate.Accelerator.save_state`/`load_state` "same environment"
+scoping caveat applies). Unlike MolmoAct2's FSDP2 path, this one has NOT
+yet been exercised through the crash+relaunch test described above --
+do that before trusting a real long run.
 
 ### Normalization
 
@@ -312,6 +352,8 @@ MolmoAct2-only flags (all ignored/unused when `--policy-type act`;
 | `--pi05-train-expert-only` | off | only the action expert trains, everything else frozen |
 | `--pi05-no-gradient-checkpointing` | off (checkpointing on) | disable only if you've confirmed the memory headroom |
 | `--pi05-empty-cameras` | `0` | pad `input_features` with dummy camera slots -- for when the pretrained checkpoint expects more cameras than this dataset has |
+| `--pi05-distributed-strategy` | `ddp` | `ddp` or `fsdp2` -- unlike MolmoAct2, usable with any freeze/expert-only combination (no LoRA to already solve memory) |
+| `--pi05-fsdp-cpu-offload` | off | trades speed for fitting on fewer/smaller GPUs -- `fsdp2` only |
 
 ```bash
 # MolmoAct2, LoRA on one GPU (run prepare_data.py for --tasks

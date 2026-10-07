@@ -43,6 +43,7 @@ may honor additional variables not listed. Not every run needs all of these.
 | `LEROBOT_S3_ANON` | unset (real credentials expected) | set to `1`/`true`/`yes` for anonymous, no-credential access to a public `s3://` dataset source (read in `training/vendor/lerobot_datasource.py`) |
 | `ROBOPOLICYKERNEL_DASHBOARD_HOST` | `127.0.0.1` (loopback-only) | exposes Ray's dashboard beyond localhost -- it has no built-in auth, so this prints a warning; SSH-tunnel instead (`ssh -L 8265:localhost:8265 <host>`) unless you specifically need this |
 | `RAY_DEDUP_LOGS` | `1` (Ray's own default -- dedupes identical log lines across workers) | set to `0` if you want every worker's identical log line printed separately instead of collapsed -- a real Ray feature, not something this project adds |
+| `NCCL_NVLS_ENABLE` / `NCCL_P2P_DISABLE` | `0` / `1` (this project's own default, applied automatically -- see below) | real fix for a shared/virtualized multi-GPU instance whose NVLink SHARP multicast isn't fully exposed to the container -- real symptom without this: `NCCL error ... Failed to bind NVLink SHARP (NVLS) Multicast memory ... CUDA error 401` during `ray.train.torch.prepare_model()`'s DDP wrap. **Exporting these in your shell before running is NOT enough on its own** -- confirmed by a real repro where a shell-exported `NCCL_NVLS_ENABLE=0` never reached the Ray Train worker process where NCCL actually initializes (Ray Train workers are spawned by Ray's own actor infrastructure, not plain child processes of this driver). Fixed at the code level instead: `training/common/ray_setup.py`'s `worker_process_setup_hook` sets both directly via `os.environ.setdefault(...)` *inside* the worker process itself, so it applies automatically on every run regardless of shell state -- no action needed. If you're on a properly-configured bare-metal NVSwitch box and want NVLS back on, a shell `export` won't reach the worker (that's the exact gap this fix works around) -- edit `_default_nccl_env()` in `training/common/ray_setup.py` directly instead |
 
 ## One environment covers every policy and every dataset
 
@@ -54,10 +55,16 @@ public PyPI wheel (`lerobot/policies/molmoact2/` is really in there) and by
 actually constructing a real `MolmoAct2Config` in this environment, not just
 an import check.
 
-Two optional extras, commented out in `requirements.txt`:
+Three optional extras, commented out in `requirements.txt`:
 - `accelerate` -- only for `--molmoact2-distributed-strategy fsdp2` (full
-  fine-tuning at scale). `--molmoact2-train-mode lora` (the default) needs
-  nothing beyond the base install.
+  fine-tuning at scale).
+- `peft` -- required for `--molmoact2-train-mode lora`, MolmoAct2's own
+  default train_mode. Confirmed via a real `ImportError` on a real first
+  MolmoAct2 run: `MolmoAct2Policy._apply_lora_adapters()` calls
+  `require_package("peft", extra="molmoact2")`. Not needed for `fft`/`freeze`
+  train modes, which never touch LoRA at all. (An earlier version of this
+  doc said LoRA "needs nothing beyond the base install" -- wrong, corrected
+  here once actually exercised for the first time.)
 - `s3fs`/`gcsfs` -- only if `--source-uri`/`--v3-root` uses `s3://` or
   `gs://` instead of `hf://` or a local path.
 

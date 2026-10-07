@@ -1,0 +1,41 @@
+# Recommended starting point for any new --policy-type pi05 run using the
+# real lerobot/pi05_droid checkpoint. Bundles the fixes/optimizations found
+# during a native-openpi-vs-Ray investigation -- see training/README.md's
+# "π0.5 normalization resolution" and "π0.5 training speed" sections for
+# the full numbers and caveats.
+#
+#   python -m training.train --tasks droid_100_test --dataset-source droid_100 \
+#       --policy-type pi05 --config-file training/configs/pi05_base_conf.yaml
+#
+# --tasks/--policy-type are still required on the command line -- see
+# training/README.md's "Config files" section. Swap model.pretrained_path
+# for a different pi05 checkpoint if you're not using droid100 --
+# chunk_size/n_action_steps must then match THAT checkpoint's own
+# config.json (see pi05_droid.yaml's header comment for why).
+
+train:
+  num_epochs: 5
+  batch_size: 8
+  window_every_steps: 200
+
+model:
+  type: pi05
+  pretrained_path: lerobot/pi05_droid
+  chunk_size: 15   # matches lerobot/pi05_droid's own config.json
+  n_action_steps: 15
+  freeze_vision_encoder: false
+  train_expert_only: false
+  gradient_checkpointing: true
+  empty_cameras: 0
+
+  # Speed fixes -- see training/README.md's "π0.5 training speed"
+  compile_model: true
+  compile_mode: default   # NOT "max-autotune" (this field's own default) -- severe warmup cost
+  vision_bf16: true        # not yet confirmed stable over a long run -- remove first if unstable
+
+# STATE/ACTION normalization fix -- see training/README.md's "π0.5
+# normalization resolution". Lives under `data:` since it's policy-agnostic.
+data:
+  normalization:
+    mode_source: checkpoint
+    stats_source: dataset

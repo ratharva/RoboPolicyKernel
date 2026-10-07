@@ -10,6 +10,29 @@ from training.common.robots import RobotSchema
 
 
 @dataclass
+class NormalizationConfig:
+    """How this run resolves STATE/ACTION normalization mode + stats --
+    shared across policies, kept separate from image normalization above.
+    See training/model/normalization.py. Defaults are a no-op (each
+    policy's own hardcoded mapping, dataset-computed mean/std stats)."""
+    # "explicit": use explicit_mode below (None -> the policy's own
+    # hardcoded default). "checkpoint": read the mode from the pretrained
+    # checkpoint's own saved config -- requires the adapter to implement
+    # get_pretrained_normalization (pi05 does; ACT/MolmoAct2 don't).
+    mode_source: str = "explicit"   # "explicit" | "checkpoint"
+    # Only used when mode_source == "explicit". One of lerobot's
+    # NormalizationMode values (MEAN_STD | MIN_MAX | QUANTILES |
+    # QUANTILE10 | IDENTITY) -- a generic override, not pi05-only.
+    explicit_mode: str | None = None
+
+    # "dataset": compute from this run's own training data. "checkpoint":
+    # use stats the checkpoint publishes (errors if it declares a mode but
+    # ships none). "explicit_file": load a stats JSON from explicit_stats_file.
+    stats_source: str = "dataset"   # "dataset" | "checkpoint" | "explicit_file"
+    explicit_stats_file: str | None = None   # required iff stats_source == "explicit_file"
+
+
+@dataclass
 class DataConfig:
     # "hf://datasets/<repo_id>" (gated repos need HF_TOKEN), "s3://<bucket>/<prefix>",
     # or "gs://<bucket>/<prefix>". See training/data_prep/source.py for backend
@@ -58,3 +81,6 @@ class DataConfig:
     # when action_representation="delta" and a same-named state component
     # exists (e.g. a gripper open/close value) -- empty by default.
     action_delta_exclude: list[str] = field(default_factory=list)
+
+    # STATE/ACTION normalization mode+stats resolution -- see NormalizationConfig.
+    normalization: NormalizationConfig = field(default_factory=NormalizationConfig)

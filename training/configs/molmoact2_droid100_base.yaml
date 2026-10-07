@@ -1,0 +1,41 @@
+# Recommended starting point for --policy-type molmoact2 against droid100,
+# matching AllenAI's own real finetuning recipe (github.com/allenai/molmoact2)
+# rather than this pipeline's own from-scratch defaults. See
+# training/README.md's "MolmoAct2 normalization resolution" section for the
+# real findings behind each field below.
+#
+#   python -m training.train --tasks droid_100_test --dataset-source droid_100 \
+#       --policy-type molmoact2 --config-file training/configs/molmoact2_droid100_base.yaml
+#
+# --tasks/--policy-type are still required on the command line -- see
+# training/README.md's "Config files" section. --lr (the llm/vlm group's
+# rate) isn't set here -- pass --lr 1e-5 to match AllenAI's full-finetune
+# recipe (or --lr 5e-5 if you switch train_mode back to lora).
+
+train:
+  batch_size: 8
+  window_every_steps: 200
+  weight_decay: 0.0        # AllenAI's real recipe uses zero weight decay
+  adam_betas: [0.9, 0.95]  # AllenAI's real recipe -- not PyTorch's own (0.9, 0.999)
+  adam_eps: 1.0e-6         # AllenAI's real recipe -- not PyTorch's own (1e-8)
+
+model:
+  type: molmoact2
+  setup_type: "single franka robotic arm in droid"    # the checkpoint's own real franka_droid prompt
+  control_mode: "absolute joint pose"                  # the checkpoint's own real franka_droid prompt
+  chunk_size: 15            # matches the checkpoint's real franka_droid action_horizon (not this
+  n_action_steps: 15        # pipeline's own default of 30)
+  train_mode: fft            # AllenAI's own real recommended default -- NOT this pipeline's own "lora"
+  distributed_strategy: fsdp2 # required for fft to be practical -- see training/README.md's FSDP2 section
+  gradient_checkpointing: true
+  # AllenAI's real full-finetune per-group LR recipe (llm group uses the
+  # flat --lr flag instead -- set that to 1e-5 on the command line).
+  optimizer_vit_lr: 5.0e-6
+  optimizer_connector_lr: 5.0e-6
+  optimizer_action_expert_lr: 5.0e-5
+
+data:
+  normalization:
+    mode_source: checkpoint
+    stats_source: dataset   # the checkpoint's franka_droid tag is 8-dim (matches --dataset-source droid,
+                             # not droid_100's 7-dim) -- use this run's own droid100 data for stats instead

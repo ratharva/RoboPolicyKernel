@@ -135,11 +135,23 @@ storage backends).
    [Customizing policies](customizing-policies.md#molmoact2) for exactly
    what HAS been verified at the config/integration-test level.
 
-5. **`--policy-type pi05` -- the real ~2.3B model has never actually run
-   end-to-end**, same reason as MolmoAct2: no verified real pretrained
-   checkpoint repo id was found. See
+5. **`--policy-type pi05` (~3.2-3.3B params, corrected from an earlier
+   "~2.3B" estimate) -- plain DDP is now real, end-to-end verified** against
+   the actual `lerobot/pi05_droid` checkpoint on real 1xH100/2xH100
+   hardware, including: a genuine STATE/ACTION normalization-scheme
+   mismatch found and fixed (checkpoint declares `QUANTILES`, this pipeline
+   hardcoded `MEAN_STD`) via `--normalization-mode-source checkpoint
+   --normalization-stats-source dataset`, a genuine image-normalization
+   default fix (`unit01` instead of `mean_std`, now automatic for π0.5),
+   and a full native-vs-Ray speed investigation (see `training/README.md`'s
+   "π0.5 training speed" section) that found and validated real fixes
+   (`--pi05-compile-model` + `--pi05-vision-bf16` together roughly match or
+   beat native's per-step compute time). `--pi05-distributed-strategy
+   fsdp2` remains **unverified** -- none of this round's real runs used it
+   (all were plain DDP); it still has NOT been exercised live, not even at
+   the fake-policy level. See
    [Customizing policies](customizing-policies.md#π05) for what HAS been
-   verified.
+   verified and exactly what remains open for the FSDP2 path specifically.
 
 6. **`--dataset-source droid` -- real-tested against `lerobot/droid_100`
    (2GB), not against `cadene/droid_1.0.1`** (18.4GB, the dataset the

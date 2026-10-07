@@ -55,3 +55,39 @@ def compute_dataset_stats(ds, cfg: DataConfig, n_samples: int = 500) -> dict:
 
     print(f"  computed stats for: {list(stats.keys())}")
     return stats
+
+
+def compute_quantile_stats(
+    ds, cfg: DataConfig, n_samples: int = 500, quantiles: tuple[float, float] = (0.01, 0.99)
+) -> dict:
+    """Same 500-row sampling shape as compute_dataset_stats -- only the
+    reduction differs (np.quantile instead of mean/std). Key names match
+    lerobot's NormalizerProcessorStep._apply_transform: QUANTILES wants
+    "q01"/"q99", QUANTILE10 wants "q10"/"q90" -- derived generically from
+    whatever quantiles tuple is passed. Only STATE/ACTION -- images always
+    stay VISUAL="IDENTITY" (see training/model/image_normalization.py)."""
+    lo, hi = quantiles
+    lo_key, hi_key = f"q{round(lo * 100):02d}", f"q{round(hi * 100):02d}"
+
+    print(f"Sampling {n_samples} rows to compute {lo_key}/{hi_key} quantile stats ...")
+    rows = ds.take(n_samples)
+    if not rows:
+        raise ValueError("dataset produced zero rows -- can't compute normalization stats")
+
+    states = np.stack([r["observation.state"] for r in rows])  # (N, state_dim)
+    actions = np.stack([r["action"] for r in rows])  # (N, chunk_size, action_dim)
+    is_pad = np.stack([r["action_is_pad"] for r in rows])  # (N, chunk_size)
+    valid_actions = actions[~is_pad]  # (M, action_dim) -- excludes padded chunk tail
+
+    stats: dict = {
+        "observation.state": {
+            lo_key: np.quantile(states, lo, axis=0).tolist(),
+            hi_key: np.quantile(states, hi, axis=0).tolist(),
+        },
+        "action": {
+            lo_key: np.quantile(valid_actions, lo, axis=0).tolist(),
+            hi_key: np.quantile(valid_actions, hi, axis=0).tolist(),
+        },
+    }
+    print(f"  computed {lo_key}/{hi_key} quantile stats for: {list(stats.keys())}")
+    return stats

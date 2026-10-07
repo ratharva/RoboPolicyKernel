@@ -219,6 +219,9 @@ python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k -
 | `--molmoact2-fsdp-cpu-offload` | off | trades speed for fitting on fewer/smaller GPUs -- `fsdp2` only |
 | `--molmoact2-offload-tokenization` | off | run MolmoAct2's tokenizer+image-processor as a Ray Data stage instead of inline in the training loop |
 | `--molmoact2-offload-concurrency` | auto (from live CPU count) | Ray Data actor-pool size for the above |
+| `--molmoact2-revision` | none (Hub latest) | pins weight loading to a specific Hub revision/commit/tag |
+| `--molmoact2-norm-tag` | none | selects a real checkpoint-published tag (e.g. `franka_droid`) from `norm_stats.json` -- see "MolmoAct2 normalization resolution" below |
+| `--adam-beta1` / `--adam-beta2` / `--adam-eps` | `0.9` / `0.999` / `1e-8` | AdamW hyperparameters (PyTorch's own defaults) -- generic, used by every policy's optimizer |
 
 ```bash
 # LoRA on one GPU (the starting point -- get this working before fft)
@@ -257,14 +260,89 @@ python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k -
     --molmoact2-vit-lr 1e-6 --molmoact2-connector-lr 5e-5 --molmoact2-action-expert-lr 1e-4
 ```
 
+### MolmoAct2 normalization resolution
+
+Same class of bug as π0.5's (see below): `training/model/molmoact2.py` hardcodes
+`{"STATE": "MEAN_STD", "ACTION": "MEAN_STD"}`, but the real installed
+`MolmoAct2Config()`'s own default is `QUANTILES`/`QUANTILES` (confirmed via
+`dataclasses.fields`), and AllenAI's own real finetuning code
+(`github.com/allenai/molmoact2`) defaults `--norm_mode q01_q99` -- both
+independently agree. Unlike π0.5's checkpoint, `allenai/MolmoAct2`'s own
+`norm_stats.json` publishes real numeric quantile stats (`q01`/`q99`/etc.,
+per dataset "tag" -- e.g. `franka_droid` for DROID/Franka), so
+`--normalization-stats-source checkpoint` is genuinely usable here, not
+just the scheme:
+
+```bash
+# Read-only: print what the checkpoint's franka_droid tag declares vs. this run's config
+python -m training.train --tasks droid_100_test --dataset-source droid_100 --policy-type molmoact2 \
+    --molmoact2-setup-type "single franka robotic arm in droid" \
+    --molmoact2-control-mode "absolute joint pose" \
+    --molmoact2-norm-tag franka_droid --inspect-normalization
+```
+
+**Real, confirmed dimension mismatch**: `franka_droid`'s stats are 8-dim
+(matches `--dataset-source droid`, the full `cadene/droid_1.0.1`, not yet
+prepared here) -- **not** `--dataset-source droid_100` (7-dim, this
+project's own small test dataset). `--normalization-stats-source checkpoint`
+against droid100 correctly hard-fails on this dimension mismatch (verified
+directly) rather than silently misapplying wrong-dim stats. The droid100
+recipe instead uses `mode_source: checkpoint` (the real QUANTILES scheme) +
+`stats_source: dataset` (computed from droid100's own 7-dim data) -- see
+`training/configs/molmoact2_droid100_base.yaml`/`molmoact2_droid100_lora.yaml`.
+
+**`--molmoact2-norm-tag` side effect, worth knowing**: setting it makes
+`MolmoAct2Policy`'s own `_apply_norm_tag_metadata` silently overwrite
+`chunk_size`/`n_action_steps` to the tag's own values at construction time
+(e.g. `franka_droid` -> 15/15, not this pipeline's own default of 30) --
+`validate_normalization` hard-fails if what you configured doesn't already
+match, rather than letting the run silently diverge from what you set.
+
+AllenAI's own real full-finetune recipe was also matched where it differs
+from this pipeline's own defaults: `train_mode: fft` + `distributed_strategy:
+fsdp2` (not this pipeline's own LoRA default), real per-group learning rates
+(`vit_lr=5e-6, connector_lr=5e-6, action_expert_lr=5e-5`, llm group via the
+flat `--lr 1e-5`), and real AdamW hyperparameters (`betas=(0.9, 0.95),
+eps=1e-6, weight_decay=0` -- PyTorch's own defaults are `(0.9, 0.999)`/`1e-8`,
+unchanged for every other policy). `training/configs/molmoact2_droid100_base.yaml`
+bundles all of this; `molmoact2_droid100_lora.yaml` is the same fix under
+this pipeline's own LoRA default, for anyone without FSDP2-capable
+multi-GPU hardware.
+
+Confirmed **not** an issue for MolmoAct2 (unlike π0.5): `float32_attention`
+(AllenAI's own deliberate fp32-attention-math precision choice) and
+`attn_implementation="sdpa"` are both already correct by default -- this
+pipeline never overrides either, and the real checkpoint's own `config.json`
+already sets them the same way AllenAI's own training code does.
+`torch.compile` is deliberately not attempted for MolmoAct2 -- no existing
+lerobot-side switch exists (unlike π0.5's), and AllenAI's own recommended
+generic-finetuning recipe (`--dynamic_seq_len=true`) disables compile too,
+using it only for their packed pretraining/reproduction recipes.
+
+**Not yet done**: an actual training run. Every finding above is verified
+against the real installed package + real checkpoint files + AllenAI's real
+training code, and the normalization hook itself is verified end-to-end via
+`--inspect-normalization` -- but MolmoAct2 has never actually been run in
+this pipeline (needs real GPU memory beyond what was available in
+development; ~20GB+ for LoRA, more for the recommended FSDP2 full-finetune
+path). Run the smoke test above first, then the normalization-fix
+comparison, before trusting either config file for a real training run.
+
 ## π0.5
 
-`--policy-type pi05` -- a PaliGemma-based VLM (~2.3B params total).
-`--pi05-pretrained-path` is **required** -- "finetuning" implies starting
-from real pretrained weights, not random init, and this project never
-identified/verified a specific real π0.5 checkpoint repo id for you (the
-standing rule here is to never guess a repo id) -- find a real one on the
-HF Hub yourself first.
+`--policy-type pi05` -- a PaliGemma-based VLM (~3.2-3.3B params total:
+gemma_2b VLM ≈2.0B + vocab embed ≈0.5B, gemma_300m action-expert ≈0.3B,
+SigLIP so400m vision tower ≈0.4B). `--pi05-pretrained-path` is
+**required** -- "finetuning" implies starting from real pretrained
+weights, not random init, and this project never identified/verified a
+specific real π0.5 checkpoint repo id for you (the standing rule here is
+to never guess a repo id) -- find a real one on the HF Hub yourself first.
+
+**Start with `training/configs/pi05_base_conf.yaml`** for any new run
+(`--config-file training/configs/pi05_base_conf.yaml`) -- it bundles the
+real, measured normalization-scheme fix and speed optimizations described
+below, instead of you needing to already know this history and pass 6+
+flags by hand.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -273,11 +351,47 @@ HF Hub yourself first.
 | `--pi05-train-expert-only` | off | only the action expert trains, everything else frozen -- combinable with `--pi05-freeze-vision-encoder` |
 | `--pi05-no-gradient-checkpointing` | off (checkpointing on) | disable only with confirmed memory headroom -- auto-wires from `PI05Config`, no extra wiring needed unlike MolmoAct2 |
 | `--pi05-empty-cameras` | `0` | pad `input_features` with dummy camera slots -- for when the pretrained checkpoint expects more cameras than this dataset has |
+| `--pi05-distributed-strategy` | `ddp` | `ddp` or `fsdp2` (accelerate-driven FSDP2 sharding, same mechanism as MolmoAct2's) -- unlike MolmoAct2, usable with ANY `--pi05-freeze-vision-encoder`/`--pi05-train-expert-only` combination (PI05 has no LoRA to already solve memory, and DDP always fully replicates the whole model regardless of what's frozen, so FSDP2's sharding benefit applies every mode) |
+| `--pi05-fsdp-cpu-offload` | off | trades speed for fitting on fewer/smaller GPUs -- `fsdp2` only |
+| `--pi05-revision` | none (Hub latest) | pins BOTH weight loading and normalization-resolution config loading to a specific Hub revision/commit/tag |
+| `--normalization-mode-source` | `explicit` | `explicit` (today's hardcoded default) or `checkpoint` (read STATE/ACTION mode from the pretrained checkpoint's own saved config) -- see "π0.5 normalization resolution" below |
+| `--normalization-stats-source` | `dataset` | `dataset`, `checkpoint`, or `explicit_file` -- see below |
+| `--pi05-compile-model` | off | **recommended, real measured ~2.4x per-step speedup** (0.46s vs 1.12s `compute_s` on real H100 hardware) -- see "π0.5 training speed" below |
+| `--pi05-compile-mode` | `max-autotune` | only with `--pi05-compile-model` -- use `default` or `reduce-overhead` instead, see below (real, measured `max-autotune` warmup cost was severe) |
+| `--pi05-vision-bf16` | off | **recommended, real measured ~1.9x per-step speedup** (0.60s vs 1.12s `compute_s`), stacks with `--pi05-compile-model` (combined: 0.35s, faster than native) -- monkey-patches lerobot internals, see below |
+| `--pi05-narrow-checkpoint` | off | tested, real, but **no measured effect** (1.12s, unchanged) -- kept as a documented dead end, not worth using |
+| `--pi05-print-attn-impl` | off | diagnostic, zero risk -- confirmed real training uses `sdpa`, not eager attention |
 
-DDP only -- no FSDP2 path exists for π0.5 in this pipeline (no real VRAM
-number ever justified building one; extending `model/pi05.py` to FSDP2
-later is a mechanical repeat of `model/molmoact2.py`'s pattern if a real
-run shows DDP doesn't fit).
+### π0.5 FSDP2
+
+`transformer_cls_names_to_wrap = ["_PiGemmaDecoderLayerBase", "SiglipEncoderLayer"]`
+-- confirmed via the real installed `lerobot==0.6.1` source: the PaliGemma
+VLM's `language_model` layers AND the separately-instantiated
+`gemma_expert.model`'s layers are both built by the same locally-scoped
+factory (`lerobot/policies/pi05/pi_gemma.py`'s
+`_get_pi_gemma_decoder_layer_base`) -- different Python class objects per
+call, but `type(m).__name__` is identical for both, so ONE name covers
+both sub-models (no MolmoAct2-style mutual-exclusivity handling needed).
+`SiglipEncoderLayer` covers the vision tower separately (a real HF
+`SiglipVisionModel`).
+
+Unlike MolmoAct2's `wrap_for_training` (which hardcodes
+`Accelerator(mixed_precision="bf16")`), PI05's does **not** pass
+`mixed_precision` at all: PI05 already hand-casts a mixed bf16/fp32 scheme
+onto individual params at construction time
+(`PaliGemmaWithExpertModel.to_bfloat16_for_selected_params`, keeping
+`vision_tower`/`multi_modal_projector`/layernorms in float32 for
+stability, before `wrap_for_training` ever runs) -- passing
+`mixed_precision="bf16"` too would blanket-recast everything back to
+bf16 and undo that split. **UNVERIFIED** (no GPU-capable dev environment
+available here): that these fp32-designated params actually survive
+`accelerator.prepare()` still showing `dtype=torch.float32` in
+`named_parameters()`, and that mixing fp32 layernorms with bf16
+attention/MLP inside the same `_PiGemmaDecoderLayerBase`-wrapped FSDP unit
+doesn't break FSDP2's flat-parameter sharding -- confirm both before
+trusting a real training run (same "same environment" `save_state`/
+`load_state` scoping and crash+resume-test discipline as MolmoAct2's FSDP2
+section applies here too).
 
 ```bash
 # Full fine-tune on one GPU
@@ -295,7 +409,113 @@ python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k -
 python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type pi05 \
     --pi05-pretrained-path <your-real-checkpoint-repo-id> \
     --pi05-empty-cameras 2
+
+# Full fine-tune with FSDP2 across multiple GPUs on one node
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type pi05 \
+    --pi05-pretrained-path <your-real-checkpoint-repo-id> \
+    --pi05-distributed-strategy fsdp2 --batch-size 32
+
+# FSDP2 with CPU offload for VRAM headroom
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type pi05 \
+    --pi05-pretrained-path <your-real-checkpoint-repo-id> \
+    --pi05-distributed-strategy fsdp2 --pi05-fsdp-cpu-offload --batch-size 32
 ```
+
+### π0.5 normalization resolution
+
+Real, confirmed bug (found via a direct native-openpi-vs-Ray training comparison
+on `lerobot/pi05_droid` + droid100): this pipeline hardcoded
+`normalization_mapping={"STATE": "MEAN_STD", "ACTION": "MEAN_STD", ...}` in
+`build_pi05_config`, but the real pretrained checkpoint's own saved config
+declares `QUANTILES` for both (confirmed via `PI05Config.from_pretrained`
+and a real HF Hub fetch) -- a genuine scheme mismatch that corrupts every
+input/target during finetuning. A second, independent bug was found in the
+same investigation: this pipeline's image-normalization default (`mean_std`)
+doesn't produce the `[0,1]` range lerobot's own pi05 model unconditionally
+expects (`img = img * 2.0 - 1.0` inside `modeling_pi05.py`) -- `unit01` is
+the correct mode, and is now π0.5's automatic default (no flag needed).
+
+`training/model/normalization.py` resolves STATE/ACTION mode and stats
+*independently* rather than hardcoding a new fixed scheme in place of the
+old one:
+```bash
+# Read the checkpoint's own declared mode+stats before training, no GPU needed
+python -m training.train --tasks <tasks> --dataset-source <source> --policy-type pi05 \
+    --pi05-pretrained-path lerobot/pi05_droid --inspect-normalization
+
+# Use the checkpoint's mode (QUANTILES), computing stats from this run's own data
+# (the checkpoint publishes NO numeric stats -- only the scheme -- confirmed via
+# a real model.safetensors header inspection, zero normalization buffers present)
+python -m training.train --tasks <tasks> --dataset-source <source> --policy-type pi05 \
+    --pi05-pretrained-path lerobot/pi05_droid \
+    --normalization-mode-source checkpoint --normalization-stats-source dataset
+```
+Real measured result on droid100 (1xH100, `--max-train-steps 1000`,
+otherwise byte-identical hyperparameters): baseline (old hardcoded
+`MEAN_STD` + `mean_std` image range) trained to a val loss of ~0.94;
+with both fixes, individual training-step losses in the back half of the
+run repeatedly land in the 0.08-0.35 range (best single value 0.08) --
+much closer to native openpi's own reference (~0.037 on the same
+checkpoint/dataset/hyperparameters) than the old baseline ever got.
+Default STATE/ACTION normalization behavior (no `--normalization-*` flags
+passed) is unchanged for every policy -- this is strictly opt-in. Default
+*image* normalization is a partial exception: pi05 sets
+`preferred_visual_normalization="unit01"` (lerobot's pi05 model
+unconditionally expects [0,1] image input), which changes
+`--default-image-normalization`'s effective default from `mean_std` to
+`unit01` for pi05 specifically, unless that flag is passed explicitly. ACT
+and MolmoAct2 are unaffected -- see `training/model/registry.py`'s
+`preferred_visual_normalization`.
+
+### π0.5 training speed (native vs Ray)
+
+A genuine, real ~2.3-2.4x native-vs-Ray per-step slowdown was found and
+root-caused during the same investigation (`perf/compute_s`: native
+~0.48s, Ray ~1.12-1.16s, identical regardless of GPU count -- confirmed via
+a real 1-GPU test that this is NOT DDP/NCCL communication overhead).
+Four candidate causes were checked directly against real code and real
+hardware, not guessed:
+
+| Cause | Verdict | Real `compute_s` |
+|---|---|---|
+| DDP/NCCL gradient sync | **ruled out** -- identical at 1 GPU (no DDP at all) | n/a |
+| Eager attention (`--pi05-print-attn-impl`) | **ruled out for training** -- lerobot only forces `_attn_implementation="eager"` inside inference-only `select_action`/`denoise_step`; training's own forward path resolves to `sdpa` | n/a |
+| `torch.compile` disabled (`--pi05-compile-model`) | **confirmed, the dominant cause** -- `PI05Config.compile_model` defaults `False` and was never wired before | 1.12s -> **0.46s** |
+| Vision runs fp32 not bf16 (`--pi05-vision-bf16`) | **confirmed, secondary contributor** -- native's own SigLIP tower runs bf16; lerobot's deliberately keeps it fp32 | 1.12s -> **0.60s** |
+| Coarse gradient-checkpoint boundary (`--pi05-narrow-checkpoint`) | tested, **no measured effect** -- the checkpointed `action_out_proj` Linear layer was never the bottleneck | 1.12s -> 1.12s (unchanged) |
+
+**Combined, `--pi05-compile-model --pi05-compile-mode default --pi05-vision-bf16`
+measured `compute_s` of 0.35s -- faster than native's 0.48s.** Recommended
+for any real π0.5 run once you've confirmed the caveats below on your own
+setup:
+```bash
+python -m training.train --tasks <tasks> --dataset-source <source> --policy-type pi05 \
+    --pi05-pretrained-path lerobot/pi05_droid \
+    --pi05-compile-model --pi05-compile-mode default --pi05-vision-bf16
+```
+
+**`--pi05-compile-mode`: do not use `max-autotune` (the field's own
+default) without deliberately choosing it.** A real test hit a severe
+warmup cost -- TorchInductor benchmarks many Triton kernel configs per
+distinct tensor shape the model executes (each search taking 4-17+
+seconds, real "OutOfMemoryError...Ignoring this choice" lines are normal,
+benign per-candidate rejections, not failures), and with this model's many
+shapes, warmup can dominate or exceed a short run entirely. Use `default`
+or `reduce-overhead` unless you've confirmed `max-autotune`'s longer
+warmup is worth it for your own run length. Also unverified: whether the
+real dataset's variable prompt/tokenized-length shapes cause repeated
+recompilation deep into a long training run rather than staying warm
+after the first occurrence of each shape.
+
+**`--pi05-vision-bf16` caveats**: real monkey-patch on the constructed
+model (casts `vision_tower`/`multi_modal_projector` to bf16, overriding
+lerobot's own choice to keep them fp32 "so we never toggle" -- see
+`training/model/pi05.py`'s `_apply_vision_bf16_override` for exactly what
+it touches and why the ordering relative to optimizer construction
+matters). Validated so far only as a short-run speed/memory measurement
+(confirmed real ~1.2-2.4GB VRAM reduction alongside the speedup) -- NOT
+yet confirmed stable (no NaN/divergence) over a long real training run.
+Confirm that before trusting it beyond a speed probe.
 
 ## Overriding the dataset source / v3 root
 
@@ -348,6 +568,39 @@ python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k -
 
 # Keep more/fewer checkpoints on disk
 python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act --checkpoint-max-to-keep 10
+```
+
+### Async checkpoint writes (`--async-checkpoint`, experimental)
+
+Plain-DDP checkpoints (no effect under `--molmoact2-distributed-strategy
+fsdp2`/`--pi05-distributed-strategy fsdp2`, which already use accelerate's
+own `save_state`/`load_state`) copy model/optimizer state to CPU
+synchronously (fast), then write it to disk via `pickle.dump` in a
+background thread while training continues on the GPU -- instead of
+stalling the training loop for the full write duration.
+`torch.distributed.checkpoint.async_save` was tried first and rejected: it
+requires a CPU-capable process-group backend (`cpu:gloo,cuda:nccl`) for
+its own internal coordination -- real coordination that matters for
+genuinely sharded/distributed checkpoints (FSDP2), but pure overhead for
+an unsharded plain-DDP checkpoint that only rank 0 ever saves -- and Ray
+Train's NCCL-only process group doesn't provide it, confirmed by a real
+`AssertionError: A CPU backend must be enabled for async save` on an
+actual run. A plain background thread sidesteps the question entirely.
+On-disk format is identical to the non-async path (`state.pkl`), so
+resuming a run that switches `--async-checkpoint` on/off between
+checkpoints just works, no format detection needed. Real tradeoff: a
+checkpoint is only reported
+to Ray's own tracking (eligible for `checkpoint_score_attribute` scoring
+or resume) one checkpoint-cycle late, once its write is confirmed
+finished -- see `train_loop.py`'s `_AsyncCheckpointer`. This also means
+Ray's own `result.metrics`/`history.jsonl` entries lag by one cycle
+whenever a checkpoint just finished writing (TensorBoard/W&B are
+unaffected -- they already have the real-time numbers). Carries real,
+not-fully-verified risk -- test with a real crash+resume before trusting
+it for a long run.
+
+```bash
+python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k --policy-type act --async-checkpoint
 ```
 
 ## After training

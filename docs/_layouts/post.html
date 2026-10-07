@@ -1,0 +1,9 @@
+---
+layout: default
+---
+<article class="legacy-post">
+  <p class="eyebrow">Project notes · {{ page.date | date: "%B %-d, %Y" }}</p>
+  <h1>{{ page.title }}</h1>
+  <p class="callout">For the current project walkthrough, see the <a href="{{ '/' | relative_url }}">project guide</a>.</p>
+  {{ content }}
+</article>

@@ -61,6 +61,15 @@ class PolicyAdapter:
     # test/* (both TensorBoard and W&B, subject to the same
     # --wandb-metrics/--wandb-metric-groups filtering) -- no new plumbing needed.
     extra_metrics: Callable[[Any, dict], dict[str, float]] | None = None
+    # (overrides) -> PretrainedNormalization. None for ACT only.
+    # Implemented by pi05 and MolmoAct2 -- see training/model/
+    # normalization.py's resolve_normalization, which calls this.
+    get_pretrained_normalization: Callable[[Any], Any] | None = None
+    # Overrides DataConfig.default_image_normalization's dataclass default
+    # ("mean_std") unless --default-image-normalization was passed
+    # explicitly. None for ACT/MolmoAct2. pi05 sets "unit01" -- lerobot's
+    # pi05 model unconditionally expects [0,1] image input.
+    preferred_visual_normalization: str | None = None
 
 
 def _act_adapter() -> PolicyAdapter:
@@ -84,21 +93,26 @@ def _molmoact2_adapter(distributed_strategy: str, offload_tokenization: bool) ->
         # requires_grad=True parameter participates in every forward pass.
         prepare_model_kwargs=None if is_fsdp2 else {"find_unused_parameters": True},
         preprocessing_offloaded=offload_tokenization,
+        get_pretrained_normalization=molmoact2.get_pretrained_normalization,
     )
 
 
-def _pi05_adapter() -> PolicyAdapter:
+def _pi05_adapter(distributed_strategy: str) -> PolicyAdapter:
     from training.model import pi05
+    is_fsdp2 = distributed_strategy == "fsdp2"
     return PolicyAdapter(
         build=pi05.build_policy_and_processor,
         forward_loss=pi05.forward_loss,
         needs_task=True,
         # No post_build_hook -- gradient checkpointing auto-wires from
         # PI05Config's own flag at construction time.
-        # No wrap_for_training/save_checkpoint/load_checkpoint -- DDP only
-        # for pi05 in this pipeline. Extending to FSDP2 later is a
-        # mechanical repeat of model/molmoact2.py's pattern.
-        prepare_model_kwargs={"find_unused_parameters": True},
+        wrap_for_training=pi05.wrap_for_training if is_fsdp2 else None,
+        save_checkpoint=pi05.save_checkpoint if is_fsdp2 else None,
+        load_checkpoint=pi05.load_checkpoint if is_fsdp2 else None,
+        prepare_model_kwargs=None if is_fsdp2 else {"find_unused_parameters": True},
+        # Both orthogonal to distributed_strategy -- wired unconditionally.
+        get_pretrained_normalization=pi05.get_pretrained_normalization,
+        preferred_visual_normalization="unit01",
     )
 
 
@@ -108,5 +122,5 @@ def get_adapter(policy_type: str, distributed_strategy: str = "ddp", offload_tok
     if policy_type == "molmoact2":
         return _molmoact2_adapter(distributed_strategy, offload_tokenization)
     if policy_type == "pi05":
-        return _pi05_adapter()
+        return _pi05_adapter(distributed_strategy)
     raise ValueError(f"unknown policy_type {policy_type!r}, expected one of ('act', 'molmoact2', 'pi05')")

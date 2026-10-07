@@ -15,6 +15,7 @@ even when a file sets them too (see each file's own header comment).
 | `molmoact2_example.yaml` | MolmoAct2, LoRA (fits on one GPU) -- the required `setup_type`/`control_mode` prompts |
 | `molmoact2_fft_example.yaml` | MolmoAct2, full fine-tune under FSDP2 -- per-group learning rates |
 | `pi05_example.yaml` | pi05 -- the required `pretrained_path` |
+| `pi05_base_conf.yaml` | **Start here for any new pi05 run** -- bundles the real, measured normalization-scheme fix and speed optimizations (`compile_model`/`vision_bf16`) found during this project's native-vs-Ray investigation. See `training/README.md`'s "π0.5 normalization resolution"/"π0.5 training speed" sections for the numbers behind it |
 | `agibot_action_space_example.yaml` | The `data:` section -- action-space selection, delta actions, per-camera image normalization (including a depth camera) |
 | `wandb_eval_example.yaml` | W&B logging, metric allow/deny-listing, episode-preview GIFs, and the val/test split |
 
