@@ -372,12 +372,19 @@ def _finish_val_pass(
     epoch: int, step: int, epoch_complete: bool, rank: int, tb_writer, wandb_run,
     best_val_loss_seen: float, async_checkpointer: "_AsyncCheckpointer | None" = None,
     normalization_snapshot: dict | None = None,
-) -> float:
+) -> tuple[float, dict, bool]:
     """Shared tail of a val pass -- gather this rank's _run_eval_pass output
     across ranks, log under val/*, and attach a checkpoint scored by THIS
     pass's loss (never training loss) when it improves best_val_loss_seen
-    (or unconditionally, per save_only_on_improvement). Returns the updated
-    best_val_loss_seen. Used by both the periodic VAL block and the
+    (or unconditionally, per save_only_on_improvement). Returns
+    (updated best_val_loss_seen, the val_report_metrics this call reported,
+    whether it saved a checkpoint) -- the periodic VAL block caches the
+    latter two so that if this same step also turns out to be the last step
+    of its epoch, the epoch-end block can re-tag this already-reported val
+    result as epoch_complete=True without re-running _run_eval_pass (a
+    second eval pass at the same step is what caused a real cross-rank
+    report() stall before -- see last_val_step's comment in
+    train_loop_per_worker). Used by both the periodic VAL block and the
     epoch-end safety-net val pass in train_loop_per_worker -- a short run
     (fewer steps than the val cadence) would otherwise end with NO
     checkpoint at all, now that neither the windowed nor epoch-end
@@ -410,7 +417,7 @@ def _finish_val_pass(
         )
     if train_cfg.log_perf_metrics and rank == 0 and save_checkpoint:
         _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
-    return best_val_loss_seen
+    return best_val_loss_seen, val_report_metrics, save_checkpoint
 
 
 def train_loop_per_worker(config: dict) -> None:
@@ -701,12 +708,18 @@ def train_loop_per_worker(config: dict) -> None:
     windows_without_improvement = 0
     should_stop = False
     # Tracks the last step the periodic VAL block actually ran at, so the
-    # epoch-end safety-net val pass (below) can skip itself when it would
-    # be a redundant, back-to-back re-run of the SAME step's val set (e.g.
-    # --max-train-steps landing exactly on a --val-every-steps boundary) --
-    # a real cross-rank ray.train.report() stall was observed from two val
-    # passes firing back-to-back at the same step, not just wasted compute.
+    # epoch-end safety-net val pass (below) can skip RE-RUNNING eval when
+    # it would be a redundant, back-to-back re-run of the SAME step's val
+    # set (e.g. --max-train-steps landing exactly on a --val-every-steps
+    # boundary) -- a real cross-rank ray.train.report() stall was observed
+    # from two val passes firing back-to-back at the same step, not just
+    # wasted compute. last_val_metrics/last_val_save_checkpoint cache that
+    # periodic pass's own already-gathered result, so the epoch-end block
+    # can still re-tag it epoch_complete=True (the checkpoint a true
+    # epoch-end needs for correct resume) without a second eval pass.
     last_val_step: int | None = None
+    last_val_metrics: dict | None = None
+    last_val_save_checkpoint = False
 
     # --- perf instrumentation (training/perf_logging.py), opt-in via
     # --log-perf-metrics -- see that module's docstring for why it's not
@@ -1004,7 +1017,7 @@ def train_loop_per_worker(config: dict) -> None:
                 # only), every rank ends up with the SAME globally-summed
                 # val loss after that gather, so this is safe to call
                 # identically on every rank.
-                best_val_loss_seen = _finish_val_pass(
+                best_val_loss_seen, last_val_metrics, last_val_save_checkpoint = _finish_val_pass(
                     val_loss_sum, val_n, val_metrics_sum, adapter, unwrapped_policy, optimizer, dist_ctx,
                     run_cfg, train_cfg, epoch, step, epoch_complete=False, rank=rank,
                     tb_writer=tb_writer, wandb_run=wandb_run, best_val_loss_seen=best_val_loss_seen,
@@ -1091,26 +1104,40 @@ def train_loop_per_worker(config: dict) -> None:
                 train_cfg.val_batch_size or train_cfg.batch_size, train_cfg.val_max_batches, device,
             )
             policy.train()
-            best_val_loss_seen = _finish_val_pass(
+            best_val_loss_seen, _, _ = _finish_val_pass(
                 epoch_val_loss_sum, epoch_val_n, epoch_val_metrics_sum, adapter, unwrapped_policy, optimizer,
                 dist_ctx, run_cfg, train_cfg, epoch, step, epoch_complete=True, rank=rank,
                 tb_writer=tb_writer, wandb_run=wandb_run, best_val_loss_seen=best_val_loss_seen,
                 async_checkpointer=async_checkpointer, normalization_snapshot=normalization_snapshot,
             )
+        elif val_shard is not None:
+            # step == last_val_step: the periodic VAL block above already
+            # ran _run_eval_pass and reported a checkpoint for this exact
+            # step, but with epoch_complete=False -- at that point, mid-loop,
+            # it wasn't yet known whether more batches remained in this
+            # epoch. Now that the for-loop over the epoch's batches has
+            # actually exhausted, this step really is the end of the epoch.
+            # Re-report the SAME already-gathered val result (last_val_metrics/
+            # last_val_save_checkpoint, cached above) tagged epoch_complete=True
+            # instead of re-running _run_eval_pass -- a second eval pass at
+            # the same step is exactly what caused the real cross-rank
+            # report() stall last_val_step's comment describes. Without this,
+            # the only checkpoint covering this step permanently says
+            # epoch_complete=False, so resuming after a run that stopped
+            # right here would re-train the already-completed epoch (the
+            # same class of bug CLAUDE.md's epoch_complete gotcha documents).
+            with perf_logging.Timer() as t_ckpt:
+                _report_with_checkpoint(
+                    last_val_metrics, adapter, unwrapped_policy, optimizer, dist_ctx,
+                    run_cfg, epoch, step, epoch_complete=True, rank=rank,
+                    save_checkpoint=last_val_save_checkpoint,
+                    async_checkpointer=async_checkpointer, normalization_snapshot=normalization_snapshot,
+                )
+            if train_cfg.log_perf_metrics and rank == 0 and last_val_save_checkpoint:
+                _log_all(tb_writer, wandb_run, "perf", {"checkpoint_save_s": t_ckpt.elapsed}, step, train_cfg)
         else:
-            # Either val is disabled entirely, OR periodic val already ran
-            # at this exact step -- report the training-loss epoch summary
-            # for bookkeeping symmetry (every rank must still call
-            # ray.train.report() once here), but NEVER attach a checkpoint
-            # from it when val is active: val already owns (or, via the
-            # async one-cycle lag, will shortly own) retention for this
-            # step, so a redundant training-loss-scored checkpoint here
-            # would just pollute the same scoring pool val is supposed to
-            # own exclusively.
-            save_checkpoint = (
-                False if val_shard is not None
-                else (improved if train_cfg.save_only_on_improvement else True)
-            )
+            # val disabled entirely -- unchanged training-loss-scored report.
+            save_checkpoint = improved if train_cfg.save_only_on_improvement else True
             with perf_logging.Timer() as t_ckpt:
                 _report_with_checkpoint(
                     metrics, adapter, unwrapped_policy, optimizer, dist_ctx,

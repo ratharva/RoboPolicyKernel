@@ -147,7 +147,7 @@ def main() -> None:
                          help="AdamW weight decay")
     parser.add_argument("--adam-beta1", type=float, default=None, help="AdamW beta1 (default: config value or 0.9)")
     parser.add_argument("--adam-beta2", type=float, default=None, help="AdamW beta2 (default: config value or 0.999)")
-    parser.add_argument("--adam-eps", type=float, default=1e-8, help="AdamW eps -- PyTorch's own default")
+    parser.add_argument("--adam-eps", type=float, default=None, help="AdamW eps (default: config value or 1e-8)")
     parser.add_argument("--max-train-steps", type=int, default=None,
                          help="cap total steps for a smoke run; omit for a full run over the data")
     parser.add_argument("--window-every-steps", type=int, default=200,
@@ -544,7 +544,12 @@ def main() -> None:
         configured if override is None else override
         for configured, override in zip(run_cfg.train.adam_betas, (args.adam_beta1, args.adam_beta2))
     )
-    _apply_if_explicit(run_cfg.train, "adam_eps", args, "adam_eps", parser)
+    # None-sentinel merge, not _apply_if_explicit -- adam_eps's own natural
+    # default (1e-8) is a real, legitimate value a user might explicitly
+    # pass, which _apply_if_explicit's "differs from parser default" check
+    # can't distinguish from having passed nothing at all.
+    if args.adam_eps is not None:
+        run_cfg.train.adam_eps = args.adam_eps
     _apply_if_explicit(run_cfg.train, "max_train_steps", args, "max_train_steps", parser)
     _apply_if_explicit(run_cfg.train, "window_every_steps", args, "window_every_steps", parser)
     if run_cfg.train.window_every_steps <= 0:

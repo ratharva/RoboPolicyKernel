@@ -154,7 +154,19 @@ def resolve_normalization(
         pretrained = inspect_pretrained_normalization(policy_type, model_cfg)
 
     if norm_cfg.mode_source == "checkpoint":
-        mode = pretrained.mode if pretrained is not None else None
+        # Some adapters (pi05) read mode straight off the real checkpoint's
+        # own saved config, which may legitimately declare a non-IDENTITY
+        # VISUAL scheme (that checkpoint's own pretraining normalized
+        # images itself). This codebase's own image_normalization.py
+        # already owns 100% of per-camera image scaling -- wiring a
+        # non-IDENTITY VISUAL through here into normalization_mapping would
+        # silently double-normalize every frame. Force it back to IDENTITY
+        # here, the one shared, policy-agnostic place every mode_source
+        # path funnels through, rather than trusting each adapter to
+        # re-derive this invariant on its own (MolmoAct2's hook happens to
+        # hardcode it safely; pi05's doesn't, which is what let this
+        # through in the first place).
+        mode = {**pretrained.mode, "VISUAL": "IDENTITY"} if pretrained is not None else None
     elif norm_cfg.explicit_mode is not None:
         mode = {"VISUAL": "IDENTITY", "STATE": norm_cfg.explicit_mode, "ACTION": norm_cfg.explicit_mode}
     else:

@@ -61,9 +61,9 @@ class PolicyAdapter:
     # test/* (both TensorBoard and W&B, subject to the same
     # --wandb-metrics/--wandb-metric-groups filtering) -- no new plumbing needed.
     extra_metrics: Callable[[Any, dict], dict[str, float]] | None = None
-    # (overrides) -> PretrainedNormalization. None for ACT/MolmoAct2.
-    # Implemented by pi05 -- see training/model/normalization.py's
-    # resolve_normalization, which calls this.
+    # (overrides) -> PretrainedNormalization. None for ACT only.
+    # Implemented by pi05 and MolmoAct2 -- see training/model/
+    # normalization.py's resolve_normalization, which calls this.
     get_pretrained_normalization: Callable[[Any], Any] | None = None
     # Overrides DataConfig.default_image_normalization's dataclass default
     # ("mean_std") unless --default-image-normalization was passed

@@ -457,8 +457,15 @@ with both fixes, individual training-step losses in the back half of the
 run repeatedly land in the 0.08-0.35 range (best single value 0.08) --
 much closer to native openpi's own reference (~0.037 on the same
 checkpoint/dataset/hyperparameters) than the old baseline ever got.
-Default behavior (no `--normalization-*` flags passed) is unchanged for
-every policy -- this is strictly opt-in.
+Default STATE/ACTION normalization behavior (no `--normalization-*` flags
+passed) is unchanged for every policy -- this is strictly opt-in. Default
+*image* normalization is a partial exception: pi05 sets
+`preferred_visual_normalization="unit01"` (lerobot's pi05 model
+unconditionally expects [0,1] image input), which changes
+`--default-image-normalization`'s effective default from `mean_std` to
+`unit01` for pi05 specifically, unless that flag is passed explicitly. ACT
+and MolmoAct2 are unaffected -- see `training/model/registry.py`'s
+`preferred_visual_normalization`.
 
 ### π0.5 training speed (native vs Ray)
 
