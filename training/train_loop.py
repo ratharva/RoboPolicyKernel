@@ -168,6 +168,15 @@ class _AsyncCheckpointer:
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._future = None
         self._pending: tuple[dict, str, int, int, bool] | None = None
+        # Owned here, not derived from `step` by the caller -- two distinct
+        # saves can legitimately share the same step (the periodic-VAL
+        # checkpoint and the epoch-end epoch_complete=True re-tag of that
+        # same step, see train_loop_per_worker's last_val_step handling).
+        # A step-keyed directory would collide: the second save() call
+        # would write into the SAME directory the first save's result is
+        # about to be shutil.rmtree'd from in _attach_finished_async_checkpoint,
+        # a real corrupt-or-lost-checkpoint race, not just a theoretical one.
+        self._save_counter = 0
 
     def _flush_pending(self) -> tuple[dict, str, int, int, bool] | None:
         if self._future is None:
@@ -178,13 +187,16 @@ class _AsyncCheckpointer:
         return pending
 
     def save(
-        self, state: dict, ckpt_dir: str, metrics: dict, epoch: int, step: int, epoch_complete: bool,
+        self, state: dict, base_dir: str, metrics: dict, epoch: int, step: int, epoch_complete: bool,
     ) -> tuple[dict, str, int, int, bool] | None:
         """Waits for any previous save to finish (returning ITS
         (metrics, ckpt_dir, epoch, step, epoch_complete) for the caller to
         report to Ray), then kicks off a NEW background save for `state`
-        and remembers it as pending. Caller must gate this to rank 0 only."""
+        under a freshly-allocated subdirectory of `base_dir` and remembers
+        it as pending. Caller must gate this to rank 0 only."""
         finished = self._flush_pending()
+        ckpt_dir = os.path.join(base_dir, f"_async_checkpoint_tmp_{self._save_counter}")
+        self._save_counter += 1
         os.makedirs(ckpt_dir, exist_ok=True)
         cpu_state = _clone_state_to_cpu(state)
         self._future = self._executor.submit(_write_pickle_checkpoint, cpu_state, ckpt_dir)
@@ -265,16 +277,14 @@ def _report_with_checkpoint(
         # cycle's real numbers from _log_all above, so nothing is actually
         # lost, but Ray's own history looks one checkpoint-cycle stale.
         if rank == 0:
-            ckpt_dir = os.path.join(
-                run_cfg.storage_root, run_cfg.run_name, f"_async_checkpoint_tmp_{step}",
-            )
+            base_dir = os.path.join(run_cfg.storage_root, run_cfg.run_name)
             state = {
                 "model": _trainable_state_dict(unwrapped_policy),
                 "optim": optimizer.state_dict(),
                 "epoch": epoch, "step": step, "epoch_complete": epoch_complete,
                 "normalization": normalization_snapshot,
             }
-            finished = async_checkpointer.save(state, ckpt_dir, metrics, epoch, step, epoch_complete)
+            finished = async_checkpointer.save(state, base_dir, metrics, epoch, step, epoch_complete)
             if finished is not None:
                 _attach_finished_async_checkpoint(finished)
             else:
