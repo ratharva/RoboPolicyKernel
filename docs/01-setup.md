@@ -55,10 +55,16 @@ public PyPI wheel (`lerobot/policies/molmoact2/` is really in there) and by
 actually constructing a real `MolmoAct2Config` in this environment, not just
 an import check.
 
-Two optional extras, commented out in `requirements.txt`:
+Three optional extras, commented out in `requirements.txt`:
 - `accelerate` -- only for `--molmoact2-distributed-strategy fsdp2` (full
-  fine-tuning at scale). `--molmoact2-train-mode lora` (the default) needs
-  nothing beyond the base install.
+  fine-tuning at scale).
+- `peft` -- required for `--molmoact2-train-mode lora`, MolmoAct2's own
+  default train_mode. Confirmed via a real `ImportError` on a real first
+  MolmoAct2 run: `MolmoAct2Policy._apply_lora_adapters()` calls
+  `require_package("peft", extra="molmoact2")`. Not needed for `fft`/`freeze`
+  train modes, which never touch LoRA at all. (An earlier version of this
+  doc said LoRA "needs nothing beyond the base install" -- wrong, corrected
+  here once actually exercised for the first time.)
 - `s3fs`/`gcsfs` -- only if `--source-uri`/`--v3-root` uses `s3://` or
   `gs://` instead of `hf://` or a local path.
 

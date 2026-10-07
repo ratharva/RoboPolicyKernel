@@ -221,7 +221,7 @@ python -m training.train --tasks dress_the_teddy_bear --dataset-source abc130k -
 | `--molmoact2-offload-concurrency` | auto (from live CPU count) | Ray Data actor-pool size for the above |
 | `--molmoact2-revision` | none (Hub latest) | pins weight loading to a specific Hub revision/commit/tag |
 | `--molmoact2-norm-tag` | none | selects a real checkpoint-published tag (e.g. `franka_droid`) from `norm_stats.json` -- see "MolmoAct2 normalization resolution" below |
-| `--adam-beta1` / `-beta2` / `-eps` | `0.9` / `0.999` / `1e-8` | AdamW hyperparameters (PyTorch's own defaults) -- generic, used by every policy's optimizer |
+| `--adam-beta1` / `--adam-beta2` / `--adam-eps` | `0.9` / `0.999` / `1e-8` | AdamW hyperparameters (PyTorch's own defaults) -- generic, used by every policy's optimizer |
 
 ```bash
 # LoRA on one GPU (the starting point -- get this working before fft)

@@ -89,6 +89,21 @@ def _log_all(
             wandb_run.log(filtered, step=wandb_step if wandb_step is not None else step)
 
 
+def _trainable_state_dict(module: torch.nn.Module) -> dict:
+    """Full state_dict() includes every parameter and buffer regardless of
+    requires_grad. Filters out only frozen (requires_grad=False) PARAMETERS
+    -- buffers are always kept (typically tiny; safer than auditing every
+    policy's buffers for train-time mutation). Frozen parameters don't need
+    saving: adapter.build() deterministically reconstructs them from
+    model_cfg.checkpoint_path/revision on every construction, resume or
+    fresh -- no policy's build_policy_and_processor branches on resume
+    state. Real, confirmed benefit: a --molmoact2-train-mode freeze run
+    (only ~620M of ~5.49B params trainable) was producing a 13GB checkpoint
+    -- the full frozen VLM included -- before this fix."""
+    frozen = {name for name, param in module.named_parameters() if not param.requires_grad}
+    return {k: v for k, v in module.state_dict().items() if k not in frozen}
+
+
 def _clone_state_to_cpu(obj):
     """Recursively clones every torch.Tensor found in a nested dict/list/
     tuple structure to a detached CPU copy -- a stable snapshot safe to
@@ -254,7 +269,7 @@ def _report_with_checkpoint(
                 run_cfg.storage_root, run_cfg.run_name, f"_async_checkpoint_tmp_{step}",
             )
             state = {
-                "model": unwrapped_policy.state_dict(),
+                "model": _trainable_state_dict(unwrapped_policy),
                 "optim": optimizer.state_dict(),
                 "epoch": epoch, "step": step, "epoch_complete": epoch_complete,
                 "normalization": normalization_snapshot,
@@ -272,7 +287,7 @@ def _report_with_checkpoint(
     # state_dict, rank 0 only. This is what --async-checkpoint replaces.
     if rank == 0:
         state = {
-            "model": unwrapped_policy.state_dict(),
+            "model": _trainable_state_dict(unwrapped_policy),
             "optim": optimizer.state_dict(),
             "epoch": epoch, "step": step, "epoch_complete": epoch_complete,
             "normalization": normalization_snapshot,
@@ -399,6 +414,10 @@ def _finish_val_pass(
 
 
 def train_loop_per_worker(config: dict) -> None:
+    # Real wall-clock marker -- paired with train.py's own _mark_phase prints,
+    # this brackets Ray Train's own worker-launch overhead (time between the
+    # driver calling trainer.fit() and a worker actually starting to run).
+    print(f"  (worker started at {time.time():.1f})")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     run_cfg: RunConfig = config["run_cfg"]
     data_cfg = run_cfg.data
@@ -520,7 +539,27 @@ def train_loop_per_worker(config: dict) -> None:
             with checkpoint.as_directory() as d:
                 with open(os.path.join(d, "state.pkl"), "rb") as f:
                     state = pickle.load(f)
-                unwrapped_policy.load_state_dict(state["model"])
+                # strict=False: state["model"] may only contain trainable
+                # params (see _trainable_state_dict) -- frozen params are
+                # already correctly set by adapter.build() above. Old-format
+                # checkpoints (full state dict, predating this) still load
+                # fine here too (zero missing keys). The real failure this
+                # guards against is resuming into a run with a DIFFERENT
+                # trainable/frozen split than the one that saved this
+                # checkpoint (e.g. train_mode changed between save and
+                # resume) -- that would silently load a wrong/incomplete
+                # model without this check.
+                load_result = unwrapped_policy.load_state_dict(state["model"], strict=False)
+                frozen_now = {name for name, param in unwrapped_policy.named_parameters() if not param.requires_grad}
+                bad_missing = set(load_result.missing_keys) - frozen_now
+                if bad_missing or load_result.unexpected_keys:
+                    raise RuntimeError(
+                        f"resume checkpoint's saved model state doesn't match this run's trainable/"
+                        f"frozen split -- missing keys that should be trainable now: {sorted(bad_missing)}; "
+                        f"unexpected keys: {sorted(load_result.unexpected_keys)}. This usually means "
+                        f"resuming into a run with a different train_mode/frozen-parameter configuration "
+                        f"than the one that saved this checkpoint."
+                    )
                 optimizer.load_state_dict(state["optim"])
         # Only advance to the next epoch when the checkpoint actually
         # finished one; otherwise resume the same epoch (its data iterator

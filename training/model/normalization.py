@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from math import isfinite
+from numbers import Real
 
 from training.common.config import DataConfig, NormalizationConfig
 from training.common.robots import RobotSchema
@@ -20,6 +22,13 @@ from training.common.robots import RobotSchema
 # STATE/ACTION are ever resolved here -- VISUAL always stays IDENTITY (see
 # training/model/image_normalization.py, which owns 100% of image scaling).
 _FEATURE_COLUMNS = {"STATE": "observation.state", "ACTION": "action"}
+_STAT_KEYS = {
+    "MEAN_STD": ("mean", "std"),
+    "MIN_MAX": ("min", "max"),
+    "QUANTILES": ("q01", "q99"),
+    "QUANTILE10": ("q10", "q90"),
+    "IDENTITY": (),
+}
 
 
 @dataclass
@@ -52,7 +61,7 @@ def inspect_pretrained_normalization(policy_type: str, model_cfg) -> PretrainedN
     """Read-only, no training-data access. Used by --inspect-normalization
     and internally by resolve_normalization -- same function both call, so
     the two stay in sync. None when the adapter has no
-    get_pretrained_normalization hook (ACT, MolmoAct2 today)."""
+    get_pretrained_normalization hook (currently ACT)."""
     from training.model.registry import get_adapter
 
     adapter = get_adapter(policy_type)
@@ -163,10 +172,6 @@ def resolve_normalization(
     return ResolvedNormalization(mode=mode, stats=stats, pretrained=pretrained)
 
 
-def _stat_vector_len(feature_stats: dict) -> int:
-    return len(next(iter(feature_stats.values())))
-
-
 def validate_normalization(
     resolved: ResolvedNormalization, data_cfg: DataConfig, robot: RobotSchema, policy_type: str, model_cfg,
 ) -> None:
@@ -200,17 +205,47 @@ def validate_normalization(
                 "or --normalization-stats-source explicit_file <path> instead."
             )
 
-    if resolved.stats:
-        for feature_type, column in _FEATURE_COLUMNS.items():
-            if column not in resolved.stats:
-                continue
-            expected_dim = robot.state_dim if column == "observation.state" else robot.action_dim
-            actual_dim = _stat_vector_len(resolved.stats[column])
-            if actual_dim != expected_dim:
+    external_stats = norm_cfg.stats_source in ("checkpoint", "explicit_file")
+    if external_stats and resolved.mode is None:
+        raise ValueError(
+            "Checkpoint or explicit-file statistics require a resolved normalization mode. "
+            "Set --normalization-mode-source checkpoint or --normalization-explicit-mode."
+        )
+    if external_stats and not isinstance(resolved.stats, dict):
+        raise ValueError("Normalization statistics must be a mapping of feature columns to statistics.")
+
+    for feature_type, column in _FEATURE_COLUMNS.items():
+        mode = (resolved.mode or {}).get(feature_type)
+        if external_stats and mode not in _STAT_KEYS:
+            raise ValueError(f"A supported normalization mode is required for {feature_type}, got {mode!r}.")
+        if norm_cfg.stats_source == "checkpoint" and resolved.pretrained is not None:
+            checkpoint_mode = resolved.pretrained.mode.get(feature_type)
+            if mode != checkpoint_mode:
                 raise ValueError(
-                    f"resolved {column!r} normalization stats have dim {actual_dim}, but this run's "
-                    f"RobotSchema declares {column!r} dim {expected_dim} -- these must match. Check "
-                    "--action-space/dataset schema against the stats source."
+                    f"Resolved {feature_type} mode {mode!r} differs from checkpoint mode "
+                    f"{checkpoint_mode!r}; checkpoint statistics must use their declared mode."
+                )
+        if mode == "IDENTITY":
+            continue
+        # Dataset resolution intentionally supplies only the quantile features;
+        # MEAN_STD features use train.py's previously computed dataset statistics.
+        if not external_stats and (not resolved.stats or column not in resolved.stats):
+            continue
+        feature_stats = (resolved.stats or {}).get(column)
+        if not isinstance(feature_stats, dict):
+            raise ValueError(f"Missing normalization statistics for {column!r} ({mode}).")
+        expected_dim = robot.state_dim if column == "observation.state" else robot.action_dim
+        for key in _STAT_KEYS.get(mode, ()):
+            values = feature_stats.get(key)
+            if values is None:
+                raise ValueError(f"Normalization statistics for {column!r} ({mode}) require {key!r}.")
+            if not isinstance(values, (list, tuple)) or len(values) != expected_dim or any(
+                not isinstance(value, Real) or isinstance(value, bool) or not isfinite(value)
+                for value in values
+            ):
+                raise ValueError(
+                    f"Normalization statistic {column!r}.{key} must be a finite numeric vector "
+                    f"with dim {expected_dim}. Check --action-space/dataset schema against the stats source."
                 )
 
     # MolmoAct2-specific, independent of mode_source/stats_source: setting
@@ -236,7 +271,9 @@ def validate_normalization(
                     "or the run's real behavior will diverge from what you configured."
                 )
 
-    if norm_cfg.mode_source == "checkpoint" and resolved.pretrained is not None:
+    if policy_type == "pi05" and resolved.pretrained is not None and (
+        norm_cfg.mode_source == "checkpoint" or norm_cfg.stats_source == "checkpoint"
+    ):
         p = resolved.pretrained
         if p.max_state_dim is not None and robot.state_dim > p.max_state_dim:
             raise ValueError(

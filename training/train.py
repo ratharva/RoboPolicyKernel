@@ -94,6 +94,18 @@ def _load_base_run_config(config_file: str | None) -> RunConfig:
 
 
 def main() -> None:
+    # Real wall-clock phase timing -- prints "(Xs)" next to each major
+    # section marker below, so a slow run's startup can be attributed to a
+    # specific phase (Ray connect, dataset build, ...) instead of only
+    # knowing the total time-to-first-training-step after the fact.
+    _phase_start = time.time()
+
+    def _mark_phase(label: str) -> None:
+        nonlocal _phase_start
+        now = time.time()
+        print(f"  ({label} took {now - _phase_start:.1f}s)")
+        _phase_start = now
+
     # Checked before parser.parse_args() (and before --tasks/--policy-type,
     # both required=True below, would reject a bare invocation) so this
     # works as a standalone, no-other-flags-needed discovery command --
@@ -133,8 +145,8 @@ def main() -> None:
                          help="gradient accumulation steps")
     parser.add_argument("--weight-decay", type=float, default=1e-4,
                          help="AdamW weight decay")
-    parser.add_argument("--adam-beta1", type=float, default=0.9, help="AdamW beta1 -- PyTorch's own default")
-    parser.add_argument("--adam-beta2", type=float, default=0.999, help="AdamW beta2 -- PyTorch's own default")
+    parser.add_argument("--adam-beta1", type=float, default=None, help="AdamW beta1 (default: config value or 0.9)")
+    parser.add_argument("--adam-beta2", type=float, default=None, help="AdamW beta2 (default: config value or 0.999)")
     parser.add_argument("--adam-eps", type=float, default=1e-8, help="AdamW eps -- PyTorch's own default")
     parser.add_argument("--max-train-steps", type=int, default=None,
                          help="cap total steps for a smoke run; omit for a full run over the data")
@@ -526,9 +538,12 @@ def main() -> None:
     _apply_if_explicit(run_cfg.train, "lr_backbone", args, "lr_backbone", parser)
     _apply_if_explicit(run_cfg.train, "grad_accum", args, "grad_accum", parser)
     _apply_if_explicit(run_cfg.train, "weight_decay", args, "weight_decay", parser)
-    # Tuple field, no single 1:1 CLI flag -- set from either half if either was passed explicitly.
-    if args.adam_beta1 != parser.get_default("adam_beta1") or args.adam_beta2 != parser.get_default("adam_beta2"):
-        run_cfg.train.adam_betas = (args.adam_beta1, args.adam_beta2)
+    # Merge each supplied component; None distinguishes omission from an
+    # explicit value equal to the usual AdamW default.
+    run_cfg.train.adam_betas = tuple(
+        configured if override is None else override
+        for configured, override in zip(run_cfg.train.adam_betas, (args.adam_beta1, args.adam_beta2))
+    )
     _apply_if_explicit(run_cfg.train, "adam_eps", args, "adam_eps", parser)
     _apply_if_explicit(run_cfg.train, "max_train_steps", args, "max_train_steps", parser)
     _apply_if_explicit(run_cfg.train, "window_every_steps", args, "window_every_steps", parser)
@@ -770,7 +785,7 @@ def main() -> None:
         if pretrained is None:
             print(
                 f"  policy_type={run_cfg.policy_type!r} has no get_pretrained_normalization hook -- "
-                "nothing to inspect (only pi05 implements this today)."
+                "nothing to inspect for this policy."
             )
         else:
             print(f"  checkpoint declared mode: {pretrained.mode}")
@@ -823,10 +838,12 @@ def main() -> None:
             "max_episodes_per_task", run_cfg.max_episodes_per_task
         )
 
+    _mark_phase("argument parsing / config resolution")
     print("\n=== connect to Ray ===")
     connect_ray(build_runtime_env(storage_root=run_cfg.storage_root))
     print("  Data tab   -> per-operator throughput / object-store memory while decoding")
     print("  Jobs/Train -> per-worker status and the loss + policy-specific metrics reported below")
+    _mark_phase("Ray connect")
 
     ray.data.DataContext.get_current().enable_rich_progress_bars = True
     ray.data.DataContext.get_current().use_ray_tqdm = False
@@ -967,6 +984,7 @@ def main() -> None:
         test_raw_ds, test_episode_indices = _resolve_side_v3_root("test", args.test_v3_root)
         print(f"  test split: {len(test_episode_indices)} episode(s) from separate --test-v3-root {args.test_v3_root}")
 
+    _mark_phase("build Ray Data pipeline (from LeRobot v3)")
     print("\n=== compute normalization stats ===")
     # Sampled from raw_ds (pre-transpose, HWC), AFTER action-space selection/
     # delta-conversion/val-test-split above -- so stats reflect whatever's
@@ -1048,6 +1066,7 @@ def main() -> None:
     if test_ds is not None:
         datasets["test"] = test_ds
 
+    _mark_phase("normalization stats / preprocessing setup")
     print(f"\n=== launch Ray Train: {run_cfg.run_name} ===")
     trainer = ray.train.torch.TorchTrainer(
         train_loop_per_worker=train_loop_per_worker,
@@ -1081,6 +1100,7 @@ def main() -> None:
         ),
         datasets=datasets,
     )
+    _mark_phase("TorchTrainer construction")
     try:
         result = trainer.fit()
     except Exception as e:

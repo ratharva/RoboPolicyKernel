@@ -61,9 +61,18 @@ datasets
 
 # Optional: only needed for --molmoact2-distributed-strategy fsdp2 (full
 # fine-tuning at scale) -- see README's "MolmoAct2 full fine-tuning (FSDP2)"
-# section. Not needed for --molmoact2-train-mode lora (the default), which
-# uses plain DDP like ACT.
+# section. Not needed for --molmoact2-train-mode lora specifically -- but
+# see the peft entry right below, which LoRA DOES need.
 # accelerate>=1.13.0
+
+# Optional: required for --molmoact2-train-mode lora -- MolmoAct2Policy's
+# own _apply_lora_adapters() calls require_package("peft", extra="molmoact2"),
+# confirmed via a real ImportError on a real first-ever MolmoAct2 run (this
+# had gone unnoticed until then -- LoRA is MolmoAct2's own default train_mode,
+# so most --policy-type molmoact2 runs need this unless train_mode is
+# explicitly switched to "fft" or "freeze", neither of which touch LoRA at all.
+# pip install 'lerobot[molmoact2]' also works and pulls in the same package.
+# peft
 
 # Optional: only needed for --log-perf-metrics's GPU compute-utilization %
 # (torch.cuda.utilization()/memory_usage() both call into NVML under the
