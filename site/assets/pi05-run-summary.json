@@ -1,0 +1,40 @@
+{
+  "source_export": "run_data_analytics/native_vs_ray/scalars.csv",
+  "source_sha256": "f8b9fe4a48274ba8f87371099773be84908a1d66328d8c9434958d71672fb59c",
+  "ray_run": "pi05-droid100-2xh100-async-2",
+  "native_run": "tensorboard_pi_direct_train",
+  "scope": "Recorded 1,000-step pi0.5 runs; not a matched framework benchmark. GPU model and complete resolved configurations are not recorded in the scalar exports.",
+  "methodology": {
+    "gpu_utilization": "Arithmetic mean of approximately 1.5-second polls through last training iteration; includes startup after effective-batch marker and intervening validation/reporting. Native end is estimated by subtracting final save duration from its timestamp. One logged device per run.",
+    "throughput": "Harmonic mean of equal-size logged windows. Native: nine 100-step windows after step 0; Ray: ten 100-step windows including periodic validation/checkpoint/reporting time.",
+    "phase_timing": "Native: window averages excluding startup; Ray: 100 individual iterations sampled every ten steps. Compute timer boundaries differ between implementations.",
+    "elapsed_time": "Relative to effective-batch scalar, after model/data setup, not job launch."
+  },
+  "metrics": {
+    "native": {
+      "effective_batch_size": 8.0,
+      "gpu_util_through_last_training_iteration_pct": 93.70359281437126,
+      "utilization_cutoff_elapsed_s": 501.2453770637512,
+      "window_throughput_samples_per_s": 16.21769651896077,
+      "median_data_wait_ms": 12.176107615232468,
+      "mean_data_wait_ms": 12.290378411610922
+    },
+    "ray": {
+      "effective_batch_size": 16.0,
+      "gpu_util_through_last_training_iteration_pct": 72.13875598086125,
+      "utilization_cutoff_elapsed_s": 1943.0412862300873,
+      "window_throughput_samples_per_s": 8.234548963530893,
+      "median_data_wait_ms": 0.3933659754693508,
+      "mean_data_wait_ms": 5.475858945865184,
+      "mean_compute_ms": 1275.4871988296509,
+      "checkpoint_report_timer_sum_s": 401.4541015625,
+      "validation_reporting_gaps_sum_s": 170.78859782218933,
+      "first_validation_loss": 1.8287290334701538,
+      "last_validation_loss": 1.0248364210128784,
+      "best_validation_loss": 0.997356653213501,
+      "epoch_summary_elapsed_s": 2000.1333224773407,
+      "post_epoch_polling_duration_s": 828.7361674308777,
+      "post_epoch_gpu_util_pct": 0.0
+    }
+  }
+}

@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Robot policy training, explained · RoboPolicyKernel</title>
-  <meta name="description" content="How RoboPolicyKernel prepares robot demonstrations and trains ACT, MolmoAct2, and π0.5 with Ray Data and Ray Train.">
+  <title>Testing Ray for robot policy training · RoboPolicyKernel</title>
+  <meta name="description" content="Measured GPU utilization, batch wait, and throughput from π0.5 training, plus the design decisions behind RoboPolicyKernel.">
   <meta name="theme-color" content="#163b35">
   <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
   <link rel="stylesheet" href="assets/site.css">
@@ -14,7 +14,7 @@
   <header class="site-header">
     <a class="brand" href="./"><span class="brand-mark" aria-hidden="true">rk</span> RoboPolicyKernel</a>
     <nav aria-label="Main navigation">
-      <a href="#workflow">How it works</a>
+      <a href="#results">Results</a>
       <a href="#quickstart">Quick start</a>
       <a href="https://github.com/ratharva/RoboPolicyKernel">GitHub ↗</a>
     </nav>
@@ -23,31 +23,166 @@
     <aside class="sidebar">
       <p class="eyebrow">Project guide</p>
       <nav aria-label="On this site">
-        <a href="#overview">Overview</a>
+        <a href="#overview">The question</a>
+        <a href="#results">Early results</a>
+        <a href="#design-decisions">Design decisions</a>
+        <a href="#ray-review">Ray in practice</a>
         <a href="#workflow">The pipeline</a>
         <a href="#datasets">Datasets & robots</a>
         <a href="#policies">Policy adapters</a>
         <a href="#quickstart">Your first run</a>
         <a href="#training">Inside training</a>
-        <a href="#results">Results & recovery</a>
+        <a href="#recovery">Logging & recovery</a>
         <a href="#extending">Extending the project</a>
         <a href="#reference">Code & reference</a>
       </nav>
       <div class="sidebar-note">Ray Data + Ray Train<br>LeRobot policy implementations</div>
     </aside>
     <main id="content" tabindex="-1"><div class="hero" id="overview">
-<p class="eyebrow">RoboPolicyKernel / Project guide</p>
-<h1>From robot demonstrations<br>to policy training.</h1>
-<p class="lede">A training pipeline built around a simple idea: changing the dataset or policy should not mean starting over with the rest of your code.</p>
-<p>RoboPolicyKernel prepares robot teleoperation data in LeRobot v3 format, loads it with Ray Data, and trains policies with Ray Train. It brings ACT, MolmoAct2, and π0.5 into the same workflow, with separate adapters for the parts each model does differently.</p>
+<p class="eyebrow">RoboPolicyKernel / Research in progress</p>
+<h1>Can Ray keep up with<br>robot policy training?</h1>
+<p class="lede">Robot policies now learn from multi-camera video, robot state, and language at once, and the data loader is becoming the bottleneck. <a href="https://docs.ray.io/en/latest/data/data.html">Ray says its data stack handles multimodal AI at scale.</a> I'm testing whether that holds for robot demonstrations, where every sample is a synchronized slice of video, state, and action chunks.</p>
+<p>My starting hypothesis is that synchronized multimodal input can limit GPU utilization as training scales. RoboPolicyKernel is the testbed: it prepares robot teleoperation data in LeRobot v3 format, loads it with Ray Data, and trains policies with Ray Train. It brings ACT, MolmoAct2, and π0.5 into the same workflow, with separate adapters for the parts each model does differently.</p>
 <div class="hero-actions">
-<a class="button" href="#quickstart">Run a small experiment ↓</a>
+<a class="button" href="#results">See the measured results ↓</a>
 <a class="button secondary" href="https://github.com/ratharva/RoboPolicyKernel">Read the code ↗</a>
 </div>
 <div class="facts"><span>3 policy families</span><span>4 dataset schemas</span><span>1 shared training loop</span></div>
 </div>
+<section class="section" id="results">
+<p><span class="section-number">01 / EARLY RESULTS</span></p>
+<h2>What the first 1,000 steps showed.</h2>
+<p>I started with π0.5 on DROID100 and compared the recorded Ray/LeRobot run, <code>pi05-droid100-2xh100-async-2</code>, with a native OpenPI run. The question was where time went: fetching batches, executing the model, or handling the work between training windows.</p>
+<div class="metric-strip">
+<div><strong>72.14%</strong><span>Ray rank-0 GPU utilization</span></div>
+<div><strong>0.393 ms</strong><span>Ray median batch wait</span></div>
+<div><strong>8.235</strong><span>Ray samples / second</span></div>
+</div>
+
+<p><strong>My early finding: the prepared-data input path kept batches ready in this run.</strong> The median fetch took less than a millisecond. That shifts the next experiment toward model execution and evaluation/checkpoint cadence. A worker-count sweep is still needed to answer the scaling question.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Recorded metric</th>
+<th style="text-align: right;">Native OpenPI</th>
+<th style="text-align: right;">Ray + LeRobot</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Training steps</td>
+<td style="text-align: right;">1,000</td>
+<td style="text-align: right;">1,000</td>
+</tr>
+<tr>
+<td>Effective batch size</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">16</td>
+</tr>
+<tr>
+<td>GPU utilization through last training iteration</td>
+<td style="text-align: right;">93.70%</td>
+<td style="text-align: right;">72.14%</td>
+</tr>
+<tr>
+<td>Sustained logged-window throughput</td>
+<td style="text-align: right;">16.218 samples/s</td>
+<td style="text-align: right;">8.235 samples/s</td>
+</tr>
+<tr>
+<td>Median data-fetch / wait time</td>
+<td style="text-align: right;">12.176 ms</td>
+<td style="text-align: right;">0.393 ms</td>
+</tr>
+<tr>
+<td>Mean data-fetch / wait time</td>
+<td style="text-align: right;">12.290 ms</td>
+<td style="text-align: right;">5.476 ms</td>
+</tr>
+<tr>
+<td>Checkpoint/report timer count</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">10</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>How to read this comparison.</strong> These are two recorded workloads with different batch sizes, model implementations, and evaluation schedules. Native uses JAX; the Ray pipeline uses LeRobot/PyTorch and periodic held-out validation. The figures describe those runs, rather than isolating Ray overhead. Exact GPU models and complete resolved configurations are absent from the scalar export; the Ray run name suggests two H100s, but utilization is logged only for rank 0. Native logs GPU0.</p>
+<p>GPU utilization averages roughly 1.5-second polls from the effective-batch marker through the last training iteration, including intervening work. Throughput is total samples divided by summed logged-window time: nine steady native windows and ten Ray windows. Ray's windows include periodic validation, checkpoint, and reporting time; native excludes its initial step and has only a final checkpoint. The last 99 native iterations have no performance-window flush. Phase timings use native window means and 100 sampled Ray iterations.</p>
+<h3>Where I’m looking next</h3>
+<p>In the Ray run, sampled forward/backward computation averaged <strong>1,275 ms</strong>, compared with <strong>5.476 ms</strong> of batch wait. Ten checkpoint/report timers totaled <strong>401.45 seconds</strong>. Training-window-to-validation reporting gaps added <strong>170.79 seconds</strong>. Together, those timers and gaps cover <strong>28.61%</strong> of the span through the epoch summary. They give me a concrete target for a cadence experiment; the checkpoint timer includes reporting, so it is not a pure disk-write measurement.</p>
+<p>The GPU log also continues for <strong>13 minutes 49 seconds after the epoch summary</strong>, at 0% utilization. I exclude that interval from the headline training utilization and will trace final checkpoint completion and reporting separately. Its cause is not established by the scalars.</p>
+<h3>The learning signal</h3>
+<p>Ray's held-out validation loss went from <strong>1.829 to 1.025</strong>, a <strong>43.96% reduction</strong>, with its best recorded value of <strong>0.997 at step 900</strong>. This is the learning curve within this run. Native and Ray use different normalization and loss conventions, so I’m keeping their absolute losses out of a model-quality comparison.</p>
+<details class="measurement-details">
+<summary>Download the measurements and calculation notes</summary>
+<p><a href="assets/pi05-run-summary.json" download>Metric summary and measurement definitions (JSON)</a> · <a href="assets/pi05-run-scalars.csv" download>Relevant scalar samples (CSV)</a></p>
+<p>The downloads are derived from the local TensorBoard scalar export. The summary identifies the source runs and export checksum. Elapsed time starts at the effective-batch event after setup, rather than process launch. The training-end marker does not establish process exit.</p>
+</details>
+</section>
+<section class="section" id="design-decisions">
+<p><span class="section-number">02 / DESIGN DECISIONS</span></p>
+<h2>Four decisions that shaped the pipeline.</h2>
+<h3>Prepare once, then experiment on the same data</h3>
+<p>Decoding and alignment belong in preparation. Training consumes the resulting LeRobot v3 episodes. This lets me compare policies or training settings against the same prepared recordings, while measuring conversion separately from training-time batch delivery. The cost is an intermediate dataset to store and version.</p>
+<h3>Give each policy a small adapter contract</h3>
+<p>The shared loop calls <code>build</code> and <code>forward_loss</code>; adapters own model construction, processors, and policy-specific behavior. ACT, MolmoAct2, and π0.5 can share iteration and reporting without forcing their inputs or distributed setup into one implementation. A new policy adds an adapter and configuration wiring rather than a copy of the training loop.</p>
+<h3>Hold out whole episodes for validation</h3>
+<p>Neighboring frames share scene content, and action chunks overlap in time. Splitting by episode keeps those closely related samples together. Validation can then measure performance on held-out demonstrations. It drives checkpoint selection; windowed training loss drives early stopping.</p>
+<h3>Let FSDP2 own its checkpoint format</h3>
+<p>A sharded model needs every rank to participate in saving and loading. The adapter supplies distributed checkpoint hooks, while the loop keeps the common reporting and recovery flow. Checkpoints also record the epoch, step, normalization snapshot, and whether the epoch completed, so a save partway through an epoch can resume with the right interpretation.</p>
+<p>These choices make the experiments easier to compare: preparation has its own boundary, model differences have a defined home, and evaluation and recovery have explicit semantics.</p>
+</section>
+<section class="section" id="ray-review">
+<p><span class="section-number">03 / RAY IN PRACTICE</span></p>
+<h2>What Ray provides—and what I added for robotics.</h2>
+<p>Ray Data supplies the data execution pipeline, and Ray Train supplies worker orchestration and checkpoint reporting. My review so far is that this is a useful foundation: the measured batch wait is small, and the same training structure accommodates several policies. The engineering work is in defining exactly what a robot sample means and making the model, data, and recovery paths agree.</p>
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Robotics-specific work in this project</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Raw recordings</td>
+<td>Schema-driven ingestion, camera decoding, state/action alignment, and incremental episode conversion.</td>
+</tr>
+<tr>
+<td>Training samples</td>
+<td>LeRobot v3 reading, episode-aware action chunks, padding masks, and camera-key mapping.</td>
+</tr>
+<tr>
+<td>Policy inputs</td>
+<td>Model processors, task text, image scaling, and explicit state/action normalization modes and statistics.</td>
+</tr>
+<tr>
+<td>Distributed training</td>
+<td>Policy adapters, DDP/FSDP2 wrapping, and sharded save/load hooks.</td>
+</tr>
+<tr>
+<td>Experiment visibility</td>
+<td>Separate batch-wait, preprocessing, compute, optimizer, GPU utilization, and checkpoint/report timings.</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h3>Optimizations already recorded</h3>
+<p>An earlier ABC-130k preparation measurement put video decoding at roughly <strong>156 of 172 seconds</strong> for a three-camera episode. Decoding the cameras concurrently brought total episode preparation to about <strong>83 seconds</strong>—roughly <strong>2.1× faster</strong> in that measurement. This is a preparation-stage result; it describes different work from the sub-millisecond training-time median batch wait above. <a href="https://github.com/ratharva/RoboPolicyKernel/blob/main/docs/03-prepare-data.md#streaming-conversion-no-local-raw-file">Preparation timing notes</a>.</p>
+<p>Separate π0.5 profiling notes record <code>compute_s</code> going from <strong>1.12 s to 0.46 s</strong> with compilation, and to <strong>0.35 s</strong> with compilation plus the vision bf16 override. These are recorded compute-timer experiments, separate from the 1,000-step run summarized above. I’m treating them as leads for the next complete run rather than an end-to-end throughput result. <a href="https://github.com/ratharva/RoboPolicyKernel/blob/main/training/README.md#π05-training-speed-native-vs-ray">Optimization notes</a>.</p>
+<h3>The next experiments</h3>
+<ol>
+<li><strong>Match the native and Ray workloads.</strong> Fix global batch, cameras, normalization, precision, optimizer, hardware, and evaluation/checkpoint cadence. Then compare throughput and utilization over the same interval.</li>
+<li><strong>Sweep data-pipeline concurrency.</strong> Measure batch-wait p50/p95, samples/s, CPU memory, and per-device GPU utilization as concurrency grows. The hypothesis is that more input workers help only once batch delivery stops keeping up with compute.</li>
+<li><strong>Separate checkpoint work from training.</strong> Vary validation and save cadence, and time snapshot creation, writing, reporting, and final drain independently. The hypothesis is that reducing time between training windows raises sustained utilization even when batch wait is already low.</li>
+</ol>
+<p>That is the research question I’m pursuing: how much of the available GPU time can this pipeline turn into useful policy updates, and which layer needs to change next?</p>
+</section>
 <section class="section" id="workflow">
-<p><span class="section-number">01 / THE PIPELINE</span></p>
+<p><span class="section-number">04 / THE PIPELINE</span></p>
 <h2>Prepare once. Train from the result.</h2>
 <p>Robot demonstrations arrive in different forms: timestamped messages, videos alongside HDF5 arrays, or an existing LeRobot dataset. Before a model can learn from them, the camera frames, robot state, and actions need to agree on what happened at each step.</p>
 <p>The project puts that work in a separate preparation stage. Once the data is ready, you can run another training experiment without decoding the original recordings again.</p>
@@ -73,7 +208,7 @@
 <p>With preparation and training separated, the same prepared episodes can feed multiple experiments. You can change the policy or training settings while reusing the data.</p>
 </section>
 <section class="section" id="datasets">
-<p><span class="section-number">02 / DATASETS &amp; ROBOTS</span></p>
+<p><span class="section-number">05 / DATASETS &amp; ROBOTS</span></p>
 <h2>Different recordings, a common description.</h2>
 <p>Each file in <code>training/data_prep/schemas/</code> describes a dataset's camera names, state and action components, sampling rate, source location, and ingestion strategy. Those fields become a <code>RobotSchema</code> used by the rest of the pipeline.</p>
 <div class="table-wrap">
@@ -117,7 +252,7 @@
 <p><a href="https://github.com/ratharva/RoboPolicyKernel/blob/main/docs/customizing-datasets.md">Dataset extension reference</a> · <a href="https://github.com/ratharva/RoboPolicyKernel/blob/main/training/data_prep/README.md">Preparation command reference</a></p>
 </section>
 <section class="section" id="policies">
-<p><span class="section-number">03 / POLICY ADAPTERS</span></p>
+<p><span class="section-number">06 / POLICY ADAPTERS</span></p>
 <h2>Keep the model-specific work in the model.</h2>
 <p>The shared loop needs to know how to construct a policy and how to get a loss from a batch. Each policy adapter supplies those operations, along with hooks for things like distributed wrapping and checkpoint formats when needed.</p>
 <div class="table-wrap">
@@ -151,7 +286,7 @@
 <p>The adapter contract lives in <code>training/model/registry.py</code>. Its core operations are <code>build</code> and <code>forward_loss</code>; optional hooks cover distributed setup, saving/loading, and normalization. The loop handles batch iteration, optimization, reporting, and evaluation around them.</p>
 </section>
 <section class="section" id="quickstart">
-<p><span class="section-number">04 / YOUR FIRST RUN</span></p>
+<p><span class="section-number">07 / YOUR FIRST RUN</span></p>
 <h2>Start with a small ACT experiment.</h2>
 <p>The commands below prepare 20 episodes of one ABC-130k task, then run at most 50 training steps. This gives you a short first experiment to explore the workflow. Run the commands from the repository root in your Python environment, with a CUDA-capable setup for GPU training.</p>
 <h3>1. Install the training dependencies</h3>
@@ -195,7 +330,7 @@ tensorboard --logdir training/runs/act-first-run/tensorboard
 <p>Explicit CLI settings take precedence over the config file. The model's <code>type</code> in YAML must match <code>--policy-type</code>.</p>
 </section>
 <section class="section" id="training">
-<p><span class="section-number">05 / INSIDE TRAINING</span></p>
+<p><span class="section-number">08 / INSIDE TRAINING</span></p>
 <h2>What happens between a recording and a loss?</h2>
 <h3>Ray Data builds the model inputs</h3>
 <p>The reader loads the prepared episode data and cameras. The data pipeline forms future action chunks, handles padding at episode boundaries, and prepares image and state/action inputs. Where relative actions are requested, the conversion aligns action components with their corresponding state components by name.</p>
@@ -207,8 +342,8 @@ tensorboard --logdir training/runs/act-first-run/tensorboard
 <p>By default, the configuration holds out 10% of episodes for validation. Splitting by episode keeps adjacent frames from the same demonstration together. You can also provide separate prepared roots for validation and test data.</p>
 <p>Validation loss determines checkpoint retention when validation is enabled. An optional test split provides a separate evaluation after training. Early stopping follows windowed training loss, while validation loss guides checkpoint selection.</p>
 </section>
-<section class="section" id="results">
-<p><span class="section-number">06 / RESULTS &amp; RECOVERY</span></p>
+<section class="section" id="recovery">
+<p><span class="section-number">09 / LOGGING &amp; RECOVERY</span></p>
 <h2>A run should leave enough behind to understand it.</h2>
 <div class="two-col">
 <div>
@@ -225,7 +360,7 @@ tensorboard --logdir training/runs/act-first-run/tensorboard
 <p><a href="https://github.com/ratharva/RoboPolicyKernel/blob/main/training/README.md">Training flags and scenarios</a> · <a href="https://github.com/ratharva/RoboPolicyKernel/blob/main/docs/05-view-results.md">Results and recovery reference</a></p>
 </section>
 <section class="section" id="extending">
-<p><span class="section-number">07 / EXTENDING THE PROJECT</span></p>
+<p><span class="section-number">10 / EXTENDING THE PROJECT</span></p>
 <h2>Where a new dataset or policy fits.</h2>
 <h3>Add a dataset or robot</h3>
 <p>Start with the closest schema in <code>training/data_prep/schemas/</code>. Set the actual camera keys, state/action layout, sampling rate, source, and strategy-specific fields from the data you have inspected. Dataset choices are discovered from these YAML files.</p>
@@ -236,7 +371,7 @@ tensorboard --logdir training/runs/act-first-run/tensorboard
 <p><a href="https://github.com/ratharva/RoboPolicyKernel/blob/main/docs/extending.md">Step-by-step extension checklist</a></p>
 </section>
 <section class="section" id="reference">
-<p><span class="section-number">08 / KEEP EXPLORING</span></p>
+<p><span class="section-number">11 / KEEP EXPLORING</span></p>
 <h2>Find your way around the code.</h2>
 <pre><code class="language-text">training/
 ├── common/         Robot schema, data config, Ray setup
@@ -258,6 +393,6 @@ tensorboard --logdir training/runs/act-first-run/tensorboard
 </ul>
 </section></main>
   </div>
-  <footer class="site-footer"><span>RoboPolicyKernel</span><span>A guide to the code, from raw episodes to training runs.</span><a href="https://github.com/ratharva/RoboPolicyKernel">Explore the repository ↗</a></footer>
+  <footer class="site-footer"><span>RoboPolicyKernel</span><span>Experiments in robot data loading and policy training.</span><a href="https://github.com/ratharva/RoboPolicyKernel">Explore the repository ↗</a></footer>
 </body>
 </html>
