@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Testing Ray for robot policy training · RoboPolicyKernel</title>
+  <title>Feeding the GPU: Can Ray Data keep up with robot policy training?</title>
   <meta name="description" content="Newer π0.5 and MolmoAct2 run results: GPU utilization, data wait, throughput, and the design decisions behind RoboPolicyKernel.">
   <meta name="theme-color" content="#163b35">
   <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
@@ -40,9 +40,14 @@
     </aside>
     <main id="content" tabindex="-1"><div class="hero" id="overview">
 <p class="eyebrow">RoboPolicyKernel / Research in progress</p>
-<h1>Can Ray keep up with<br>robot policy training?</h1>
-<p class="lede">Robot policies now learn from multi-camera video, robot state, and language at once, and the data loader is becoming the bottleneck. <a href="https://docs.ray.io/en/latest/data/data.html">Ray says its data stack handles multimodal AI at scale.</a> I'm testing whether that holds for robot demonstrations, where every sample is a synchronized slice of video, state, and action chunks.</p>
-<p>My starting hypothesis is that synchronized multimodal input can limit GPU utilization as training scales. RoboPolicyKernel is the testbed: it prepares robot teleoperation data in LeRobot v3 format, loads it with Ray Data, and trains policies with Ray Train. It brings ACT, MolmoAct2, and π0.5 into the same workflow, with separate adapters for the parts each model does differently.</p>
+<h1>Feeding the GPU: Can Ray Data keep up with robot policy training?</h1>
+<div class="callout">
+<p><strong>Early finding: batches are usually ready when training needs them.</strong> At effective batch 8, median input wait was 0.565 ms for π0.5 and 0.116 ms for MolmoAct2.</p>
+<p>To compare GPU activity over the same part of training, I excluded the first 50 steps and measured steps 51–200. The logged GPU averaged <strong>97.3% utilization for π0.5</strong> and <strong>58.3% for MolmoAct2</strong>. That gap calls for profiling the training work between batches; it does not by itself show that MolmoAct2 needs a different GPU.</p>
+<p>Across each run’s full reporting window, input waiting accounted for 1.64% and 6.96% of wait + preprocessing + compute time, respectively. These are early measurements; the next experiment is a longer comparison with recorded hardware and matched training settings.</p>
+</div>
+<p class="lede">Foundation models increasingly learn from multiple kinds of data. For robot policies, that means camera video, robot state and actions, and language together. Can the data infrastructure keep up? <a href="https://docs.ray.io/en/latest/data/data.html">Ray says its data stack handles multimodal AI at scale.</a> I’m testing that promise on robot demonstrations, where every sample is a synchronized slice of video, state, and action chunks—and investigating how much distributing the data across training workers helps.</p>
+<p>My starting hypothesis is that synchronized multimodal input limits GPU utilization as training scales. RoboPolicyKernel is the testbed: it prepares robot teleoperation data in LeRobot v3 format, loads it with Ray Data, and trains policies with Ray Train. It brings ACT, MolmoAct2, and π0.5 into the same workflow, with separate adapters for the parts each model does differently.</p>
 <div class="hero-actions">
 <a class="button" href="#results">See the measured results ↓</a>
 <a class="button secondary" href="https://github.com/ratharva/RoboPolicyKernel">Read the code ↗</a>
@@ -54,51 +59,51 @@
 <h2>Are the GPUs busy, and are batches ready?</h2>
 <p>The headline measurements are <strong>GPU utilization, observed samples per second, and median batch wait</strong>. Together they show how busy the device is, how much training work gets done, and how long the training loop waits for input. Each group below comes from one newer run at effective batch 8.</p>
 <h3>π0.5 · 1,000 training steps</h3>
-<p><code>full_fix_tb</code> · September 10, 2026</p><div class="metric-strip">
-<div><strong>92.9%</strong><span>Mean GPU utilization through training cutoff</span></div>
+<p>Ray training · 1,000 steps · September 10, 2026<br><small>Effective batch 8 · GPU model and total device count: not recorded in the available run artifacts.</small></p><div class="metric-strip">
+<div><strong>97.3%</strong><span>GPU utilization · steps 51–200, first 50 excluded</span></div>
 <div><strong>6.36 samples/s</strong><span>Observed throughput · one logged window</span></div>
 <div><strong>0.565 ms</strong><span>Median batch wait at the training loop</span></div>
 </div><p>The logged GPU stayed busy while the prepared-data pipeline kept batch wait below a millisecond at the median. Utilization and throughput describe different aspects of the run: high utilization alone does not establish faster training.</p>
 <h3>MolmoAct2 · 200 training steps</h3>
-<p><code>molmoact2-freeze-matched</code> · September 14, 2026</p><div class="metric-strip">
-<div><strong>54.3%</strong><span>Mean GPU utilization through training cutoff</span></div>
+<p>Ray training · 200 steps · September 14, 2026<br><small>Effective batch 8 · GPU model and total device count: not recorded in the available run artifacts.</small></p><div class="metric-strip">
+<div><strong>58.3%</strong><span>GPU utilization · steps 51–200, first 50 excluded</span></div>
 <div><strong>6.24 samples/s</strong><span>Observed throughput · one logged window</span></div>
 <div><strong>0.116 ms</strong><span>Median batch wait at the training loop</span></div>
-</div><p>This newer freeze-matched experiment also shows a short batch wait. Its lower utilization makes model execution and time between updates useful targets for the next profiling run.</p>
-<p class="callout">GPU utilization is an average for the one logged device, including startup and intervening work through the training cutoff. These are observed run results; the two architectures have different training workloads.</p>
+</div><p>This 200-step Ray training run also shows a short batch wait. Excluding the first 50 steps raises utilization from 54.3% to 58.3%, so early-run effects explain part of the change. Model execution and time between updates remain useful profiling targets.</p>
+<p class="callout">Headline GPU utilization uses the same 150-step interval for both Ray runs: steps 51–200. That interval spans 185.8 seconds and 116 polls for π0.5, and 175.3 seconds and 114 polls for MolmoAct2. Throughput and median wait still describe their full logged reporting/sample windows. These are averages for one logged device; hardware and total GPU count remain unrecorded.</p>
 <h3>Native references for context</h3>
-<p>The native references use the same logged effective batch of 8. Timing boundaries, model implementations, and reporting cadence still differ, so these numbers describe the recorded workloads rather than an isolated framework speedup.</p>
+<p>This table retains the original full observed-window utilization, including early-run activity; it uses a different interval from the Ray headline cards. The native references use the same logged effective batch of 8. Timing boundaries, model implementations, and reporting cadence still differ, so these numbers describe the recorded workloads rather than an isolated framework speedup.</p>
 <div class="table-wrap">
 <table>
 <thead>
 <tr>
 <th>Policy and implementation</th>
-<th style="text-align: right;">GPU utilization</th>
+<th style="text-align: right;">Full observed-window GPU utilization</th>
 <th style="text-align: right;">Logged throughput</th>
 <th style="text-align: right;">Median batch wait</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>π0.5 · Native OpenPI</td>
+<td>π0.5 · Native OpenPI reference</td>
 <td style="text-align: right;">93.7%</td>
 <td style="text-align: right;">16.22 samples/s</td>
 <td style="text-align: right;">12.176 ms</td>
 </tr>
 <tr>
-<td>π0.5 · Ray full fix</td>
+<td>π0.5 · Ray training (1,000 steps)</td>
 <td style="text-align: right;">92.9%</td>
 <td style="text-align: right;">6.36 samples/s</td>
 <td style="text-align: right;">0.565 ms</td>
 </tr>
 <tr>
-<td>MolmoAct2 · Native batch 8</td>
+<td>MolmoAct2 · Native reference (200 steps)</td>
 <td style="text-align: right;">33.0%</td>
 <td style="text-align: right;">Not logged</td>
 <td style="text-align: right;">500.159 ms</td>
 </tr>
 <tr>
-<td>MolmoAct2 · Ray freeze-matched</td>
+<td>MolmoAct2 · Ray training (200 steps)</td>
 <td style="text-align: right;">54.3%</td>
 <td style="text-align: right;">6.24 samples/s</td>
 <td style="text-align: right;">0.116 ms</td>
@@ -107,8 +112,19 @@
 </table>
 </div>
 <h3>A promising compute result to test over a longer run</h3>
-<p>The later π0.5 <code>speedtests/combined</code> probe recorded <strong>348.7 ms mean compute time</strong>, across five sampled steps in a 50-step experiment. Project notes associate this experiment with compilation and the vision bf16 override. I’m showing it separately as an optimization finding: the next measurement is sustained samples/s over a longer run with those settings.</p><details class="measurement-details">
+<p>The π0.5 optimization trial recorded <strong>348.7 ms mean compute time</strong>, across five sampled steps in a 50-step experiment. Project notes associate this experiment with compilation and the vision bf16 override. I’m showing it separately as an optimization finding: the next measurement is sustained samples/s over a longer run with those settings.</p><details class="measurement-details">
 <summary>Compute timings, learning signals, and measurement definitions</summary>
+<h3>Experiment labels and source folders</h3>
+<ul>
+<li><strong>π0.5 · Ray training (1,000 steps)</strong> — source folder: <code>full_fix_tb</code>. Project notes associate this run with normalization changes.</li>
+<li><strong>MolmoAct2 · Ray training (200 steps)</strong> — source folder: <code>molmoact2-freeze-matched</code>. The intended setup freezes the vision-language model and trains the action expert; complete historical launch settings are not preserved in the event files.</li>
+<li><strong>π0.5 · Optimization trial (50 steps)</strong> — source folder: <code>speedtests/combined</code>. Project notes associate this trial with compilation and the vision bf16 override.</li>
+</ul>
+<p>Display names describe the measured experiment. Original source folders remain in the downloadable data for traceability.</p>
+<h3>Why exclude the first 50 steps?</h3>
+<p>A short run can give early initialization and input-pipeline warmup more weight in its mean. The fixed steps 51–200 interval compares equal step counts without selecting the busiest part of either trace. It is a post-warmup comparison window, not proof of steady state. Longer runs are still useful.</p>
+<p>The current training implementation starts GPU polling after policy construction. The measurements therefore do not establish that model loading caused the lower average. Historical launch and profiler traces would be needed to attribute the remaining idle periods.</p>
+
 <table>
 <thead>
 <tr>
@@ -130,8 +146,11 @@
 </tr>
 </tbody>
 </table>
-<p>π0.5 full-fix logs a full-epoch training mean of <strong>0.385</strong> and a final sampled minibatch loss of <strong>0.130</strong>; it has no held-out validation metric. MolmoAct2 freeze-matched logs a full-epoch training mean of <strong>0.276</strong>, a final sampled minibatch loss of <strong>0.065</strong>, and one validation value of <strong>0.424 at step 200</strong>. These describe learning within each run; their different objectives and normalization make raw cross-model loss comparisons unsuitable.</p>
-<p>Native π0.5 was recorded September 10 at 12:49 Pacific, followed by full-fix at 14:54 and the combined probe at 15:57. Native MolmoAct2 batch 8 was recorded September 14 at 01:38, followed by freeze-matched at 02:08. The freeze-matched name identifies the intended experiment; complete historical launch settings are not embedded in the scalar files.</p><h3>How the measurements are calculated</h3>
+<p>The π0.5 Ray training run logs a full-epoch training mean of <strong>0.385</strong> and a final sampled minibatch loss of <strong>0.130</strong>; it has no held-out validation metric. The MolmoAct2 Ray training run logs a full-epoch training mean of <strong>0.276</strong>, a final sampled minibatch loss of <strong>0.065</strong>, and one validation value of <strong>0.424 at step 200</strong>. These describe learning within each run; their different objectives and normalization make raw cross-model loss comparisons unsuitable.</p>
+<p>Native π0.5 was recorded September 10 at 12:49 Pacific, followed by Ray training at 14:54 and the optimization trial at 15:57. Native MolmoAct2 batch 8 was recorded September 14 at 01:38, followed by Ray training at 02:08. Complete historical launch settings are not embedded in the scalar files.</p><h3>Window-wide batch wait versus sampled step timings</h3>
+<p>The opening answer uses the recorded <code>perf/io_bound_fraction</code>: <strong>1.64% for π0.5</strong> and <strong>6.96% for MolmoAct2</strong>, each from one full reporting window. In the current training code this is summed batch wait divided by summed wait, preprocessing, and forward/backward compute. Optimizer time is outside that denominator; it is not a percentage of total job runtime.</p>
+<p>The individual phase timers are logged only every ten steps. Their sampled means can miss waits that the window accumulator includes, so dividing sampled mean wait by sampled compute time does not establish that the entire run spends under 0.1% waiting. Batch-wait timers also measure the interval before consumption, not upstream decode cost alone.</p>
+<h3>How the measurements are calculated</h3>
 <p>GPU utilization is the arithmetic mean of one device’s polling samples from the first scalar through the last logged training-loss timestamp, including startup and intervening work. For native π0.5, the end is estimated from the final checkpoint timestamp minus its save duration; its last loss window is at index 900 while GPU polls extend to 999. Later polling and checkpoint tails are excluded from the headline utilization.</p>
 <p>Phase timing excludes step 0. Ray logs sampled individual steps; native timers can be interval averages. Native π0.5 compute includes optimizer work, while Ray reports the optimizer separately. Throughput uses step-weighted logged windows: nine for native π0.5, one for the newer Ray full run, and one for Ray MolmoAct2. Missing samples/s metrics are left as missing, rather than estimated from compute time. Checkpoint timers can include reporting, and run cadences differ.</p>
 <p>These are workload observations with matched logged batch sizes, not a controlled framework benchmark. Hardware identity, camera choices, normalization, and full training settings still need to be archived together for that comparison.</p>
@@ -140,7 +159,7 @@
 <summary>Run selection, provenance, and downloadable measurements</summary>
 <p><a href="assets/training-run-summary.json" download>Current results and per-tag statistics (JSON)</a> · <a href="assets/training-run-scalars.csv" download>Current run scalar data (CSV)</a></p>
 <p>All 22 event files were inspected independently, including empty files and interrupted attempts. Five experiments are featured here. Multiple files in one directory are kept separate, and selection uses event timestamps. The summary includes each selected filename, SHA-256 checksum, dates, sample counts, and calculation rules.</p>
-<p>The original async-2 comparison remains available as a historical snapshot: <a href="assets/pi05-run-summary.json" download>older summary</a> and <a href="assets/pi05-run-scalars.csv" download>older scalars</a>. Its 72.14% utilization and 8.235 samples/s are not the newer full-fix results.</p>
+<p>The earlier π0.5 comparison remains available as a historical snapshot: <a href="assets/pi05-run-summary.json" download>older summary</a> and <a href="assets/pi05-run-scalars.csv" download>older scalars</a>. Its 72.14% utilization and 8.235 samples/s are not the newer 1,000-step Ray results.</p>
 </details>
 
 </section>
@@ -195,12 +214,12 @@
 </div>
 <h3>Optimizations already recorded</h3>
 <p>An earlier ABC-130k preparation measurement put video decoding at roughly <strong>156 of 172 seconds</strong> for a three-camera episode. Decoding the cameras concurrently brought total episode preparation to about <strong>83 seconds</strong>—roughly <strong>2.1× faster</strong> in that measurement. This is a preparation-stage result; it describes different work from the sub-millisecond training-time median batch wait above. <a href="https://github.com/ratharva/RoboPolicyKernel/blob/main/docs/03-prepare-data.md#streaming-conversion-no-local-raw-file">Preparation timing notes</a>.</p>
-<p>The newer TensorBoard extraction now puts the combined π0.5 compute probe at <strong>348.7 ms mean compute</strong>, over five sampled steps in a 50-step run. It also brings the <strong>September 14 MolmoAct2 freeze-matched run</strong> into the comparison. These results replace the older compute figures as the experiments to carry forward. <a href="#results">See the per-run tables and measurement windows above.</a></p>
+<p>The newer TensorBoard extraction now puts the π0.5 optimization trial at <strong>348.7 ms mean compute</strong>, over five sampled steps in a 50-step run. It also brings the <strong>September 14 MolmoAct2 Ray training run</strong> into the comparison. These results replace the older compute figures as the experiments to carry forward. <a href="#results">See the per-run tables and measurement windows above.</a></p>
 <h3>The next experiments</h3>
 <ol>
 <li><strong>Match the native and Ray workloads.</strong> Fix global batch, cameras, normalization, precision, optimizer, hardware, and evaluation/checkpoint cadence. Then compare throughput and utilization over the same interval.</li>
-<li><strong>Sweep data-pipeline concurrency.</strong> Measure batch-wait p50/p95, samples/s, CPU memory, and per-device GPU utilization as concurrency grows. The hypothesis is that more input workers help only once batch delivery stops keeping up with compute.</li>
-<li><strong>Separate checkpoint work from training.</strong> Vary validation and save cadence, and time snapshot creation, writing, reporting, and final drain independently. The hypothesis is that reducing time between training windows raises sustained utilization even when batch wait is already low. Carry the combined π0.5 settings into a longer run, and compare both MolmoAct2 loaders with explicitly saved freeze settings and action horizons.</li>
+<li><strong>Sweep data-pipeline concurrency.</strong> Measure batch-wait p50/p95, samples/s, CPU memory, and per-device GPU utilization as concurrency grows. The hypothesis is that more input workers help only once batch delivery stops keeping up with compute. Separately, vary the number of training workers to measure how data sharding changes aggregate throughput and per-device waiting.</li>
+<li><strong>Separate checkpoint work from training.</strong> Vary validation and save cadence, and time snapshot creation, writing, reporting, and final drain independently. The hypothesis is that reducing time between training windows raises sustained utilization even when batch wait is already low. Carry the π0.5 optimization-trial settings into a longer run, and compare both MolmoAct2 loaders with explicitly saved freeze settings and action horizons.</li>
 </ol>
 <p>That is the research question I’m pursuing: how much of the available GPU time can this pipeline turn into useful policy updates, and which layer needs to change next?</p>
 </section>

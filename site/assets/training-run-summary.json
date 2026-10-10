@@ -2,6 +2,7 @@
   "selection_policy": "Newest event by first recorded scalar within each named experiment; long runs and short probes remain separate. Every event file is independently extracted, including empty and partial files in the full inventory.",
   "methodology": {
     "gpu_utilization": "Arithmetic mean of polls from first scalar through last training loss timestamp; native pi05 end estimated from final checkpoint. Includes startup and intervening work, excludes later idle/checkpoint tail. One logged GPU, not cluster average.",
+    "post_warmup_utilization": "Fixed steps 51\u2013200: polls after the timestamp of the step-50 loss through the step-200 loss. Equal step interval for the Ray comparison; not proof that steady state has been reached. No interpolation when boundaries are missing.",
     "phase_timing": "Step 0 excluded. Ray logs individual sampled steps; native values can be interval averages. Native pi05 compute includes optimizer; Ray compute excludes separately timed optimizer.",
     "throughput": "Step-weighted harmonic mean of logged positive-step samples/s windows. Null means not logged; never inferred from compute timing. Evaluation/reporting cadence differs.",
     "identity": "Experiment roles inferred from directory names and accompanying project notes. Full historical configuration and hardware identity are not established by scalar logs.",
@@ -410,6 +411,15 @@
       "last_scalar_utc": "2026-09-10T22:17:18.019246+00:00",
       "first_scalar_timestamp": 1789077274.2631142,
       "metrics": {
+        "gpu_util_steps_51_200": {
+          "excluded_steps": 50,
+          "end_step": 200,
+          "start_elapsed_s": 83.62191200256348,
+          "end_elapsed_s": 269.37867736816406,
+          "duration_s": 185.7567653656006,
+          "sample_count": 116,
+          "mean_pct": 97.30172413793103
+        },
         "effective_batch_sizes": [
           8.0
         ],
@@ -427,7 +437,8 @@
         "wait_median_ms": 0.5654654232785106,
         "checkpoint_timer_sum_s": 105.78312301635742,
         "checkpoint_timer_count": 2
-      }
+      },
+      "display_name": "\u03c00.5 \u00b7 Ray training (1,000 steps)"
     },
     "molmoact2_freeze_matched": {
       "source": "tensorboard/molmoact2-freeze-matched/tensorboard/events.out.tfevents.1789376893.instance-gn2vo4um-main.81338.0",
@@ -670,6 +681,15 @@
       "last_scalar_utc": "2026-09-14T09:13:51.549106+00:00",
       "first_scalar_timestamp": 1789376893.0757234,
       "metrics": {
+        "gpu_util_steps_51_200": {
+          "excluded_steps": 50,
+          "end_step": 200,
+          "start_elapsed_s": 81.30253648757935,
+          "end_elapsed_s": 256.6177248954773,
+          "duration_s": 175.31518840789795,
+          "sample_count": 114,
+          "mean_pct": 58.333333333333336
+        },
         "effective_batch_sizes": [
           8.0
         ],
@@ -687,7 +707,8 @@
         "wait_median_ms": 0.1162644475698471,
         "checkpoint_timer_sum_s": 45.678157806396484,
         "checkpoint_timer_count": 1
-      }
+      },
+      "display_name": "MolmoAct2 \u00b7 Ray training (200 steps)"
     },
     "molmoact2_native_bs8": {
       "source": "tensorboard/molmoact_orig_bs8/events.out.tfevents.1789375079.instance-gn2vo4um-main.15556.0",
@@ -950,6 +971,7 @@
       "last_scalar_utc": "2026-09-14T08:42:56.824242+00:00",
       "first_scalar_timestamp": 1789375103.1252193,
       "metrics": {
+        "gpu_util_steps_51_200": null,
         "effective_batch_sizes": [
           8.0
         ],
@@ -967,7 +989,8 @@
         "wait_median_ms": 500.1589208841324,
         "checkpoint_timer_sum_s": 12.353313446044922,
         "checkpoint_timer_count": 1
-      }
+      },
+      "display_name": "MolmoAct2 \u00b7 Native reference (200 steps)"
     },
     "pi05_combined_probe": {
       "source": "tensorboard/speedtests/combined/tensorboard/events.out.tfevents.1789081078.instance-7a27nr7u-main.230174.0",
@@ -1260,6 +1283,7 @@
       "last_scalar_utc": "2026-09-10T22:59:43.148761+00:00",
       "first_scalar_timestamp": 1789081078.480628,
       "metrics": {
+        "gpu_util_steps_51_200": null,
         "effective_batch_sizes": [
           8.0
         ],
@@ -1277,7 +1301,8 @@
         "wait_median_ms": 0.5785641260445118,
         "checkpoint_timer_sum_s": 50.12517547607422,
         "checkpoint_timer_count": 1
-      }
+      },
+      "display_name": "\u03c00.5 \u00b7 Optimization trial (50 steps)"
     },
     "pi05_native": {
       "source": "tensorboard/tensorboard_pi_direct_train/events.out.tfevents.1789069750.instance-vgt69kqo-main.10180.0",
@@ -1420,6 +1445,7 @@
       "last_scalar_utc": "2026-09-10T19:57:59.548319+00:00",
       "first_scalar_timestamp": 1789069750.0799499,
       "metrics": {
+        "gpu_util_steps_51_200": null,
         "effective_batch_sizes": [
           8.0
         ],
@@ -1437,7 +1463,8 @@
         "wait_median_ms": 12.176107615232468,
         "checkpoint_timer_sum_s": 28.222991943359375,
         "checkpoint_timer_count": 1
-      }
+      },
+      "display_name": "\u03c00.5 \u00b7 Native OpenPI reference"
     }
   }
 }
