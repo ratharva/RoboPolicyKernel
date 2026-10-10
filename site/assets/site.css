@@ -13,3 +13,8 @@
 .measurement-details summary:focus-visible{outline:3px solid #778a36;outline-offset:4px}
 .measurement-details p{margin:18px 0 0}
 @media(max-width:760px){.metric-strip{grid-template-columns:1fr}.metric-strip>div{padding:20px}}
+
+.post-index{display:none}
+.pipeline-step .lead-in{margin:12px 0;font-size:21px;line-height:1.2}
+.lead-in{margin-top:24px;margin-bottom:12px}
+@media(max-width:760px){.post-index{display:block;border-top:1px solid var(--line);padding:18px 0}.post-index summary{cursor:pointer;font-weight:600}.post-index nav{display:grid;gap:8px;margin-top:14px}.post-index nav a{font-size:14px}}
