@@ -503,7 +503,9 @@ def train_loop_per_worker(config: dict) -> None:
         getattr(model_cfg, "resolved_normalization_mode", None), dataset_stats,
     )
 
+    build_t0 = time.time()
     policy, preprocessor = adapter.build(data_cfg, model_cfg, train_cfg, dataset_stats, device=str(device))
+    print(f"  (model build took {time.time() - build_t0:.1f}s)")
     policy = policy.to(device)
     if adapter.post_build_hook:
         adapter.post_build_hook(policy, model_cfg)

@@ -10,7 +10,6 @@ checkout so its YAML configs ship with it (a plain pip install drops them):
 """
 from __future__ import annotations
 
-import gc
 import os
 
 import numpy as np
@@ -163,34 +162,20 @@ def _return_plain_dict(model) -> None:
 
 
 def build_policy_and_processor(data_cfg, overrides: DreamZeroConfigOverrides, train_cfg, dataset_stats, device):
-    import torch.distributed as dist
-
-    # One local rank at a time: each CPU build peaks at a full fp32 copy (~80GB) before moving to GPU.
-    if not dist.is_initialized():
-        return _build(data_cfg, overrides, device)
-    import ray.train
-
-    ctx = ray.train.get_context()
-    model = None
-    for turn in range(ctx.get_local_world_size()):
-        if turn == ctx.get_local_rank():
-            model = _build(data_cfg, overrides, device)[0]
-            gc.collect()
-        dev = torch.device(device)
-        idx = dev.index if dev.index is not None else torch.cuda.current_device()
-        dist.barrier(device_ids=[idx] if dev.type == "cuda" else None)
-    return model, None
-
-
-def _build(data_cfg, overrides: DreamZeroConfigOverrides, device):
     from hydra.utils import instantiate
 
     cfg = compose_dreamzero_cfg(overrides, num_views=len(data_cfg.robot.camera_keys))
-    model = instantiate(cfg.model)
+    # Build and load straight in bf16 (half the CPU RAM of fp32); rope freqs use explicit float64.
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        model = instantiate(cfg.model)
+        if overrides.pretrained_path:
+            _load_full_checkpoint(model, overrides.pretrained_path)
+    finally:
+        torch.set_default_dtype(prev)
     _unpack_block_outputs_without_grad(model)
     _return_plain_dict(model)
-    if overrides.pretrained_path:
-        _load_full_checkpoint(model, overrides.pretrained_path)
     # DreamZero's head takes its working dtype from its first parameter and expects bf16
     # (their recipe runs DeepSpeed bf16); trainable params stay fp32 like DeepSpeed's master copy.
     model = model.to(device=device, dtype=torch.bfloat16)

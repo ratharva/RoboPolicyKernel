@@ -558,7 +558,7 @@ video augmentation (crop, color jitter, dropped exterior view).
 |---|---|---|
 | `--dreamzero-wan-ckpt-dir` | (required) | Wan2.1-I2V-14B-480P dir; DreamZero loads umt5/CLIP/VAE from it |
 | `--dreamzero-pretrained-path` | none | full DreamZero checkpoint dir; empty = raw Wan backbone |
-| `--dreamzero-embodiment-tag` | dataset preset | projector slot (`oxe_droid`, `agibot`, `xdof`, ...); only `droid` has a preset |
+| `--dreamzero-embodiment-tag` | dataset preset | embodiment tag (`oxe_droid`, `agibot`, `xdof`, ...); only `droid` has a preset. At the pinned commit the model forces `embodiment_id=0` (one shared projector), so the tag doesn't pick weights |
 | `--dreamzero-relative-action-dims` | dataset preset | action dims minus the same-index state dim; `droid`: 0-6 |
 | `--dreamzero-train-mode` | `lora` | `lora` or `fft` |
 | `--dreamzero-anchor-stride` | `8` | each anchor decodes 33 frames per camera |
