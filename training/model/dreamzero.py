@@ -10,6 +10,7 @@ checkout so its YAML configs ship with it (a plain pip install drops them):
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 
@@ -114,6 +115,21 @@ def compose_dreamzero_cfg(o: DreamZeroConfigOverrides, num_views: int):
         return compose(config_name="conf", overrides=overrides)
 
 
+@contextlib.contextmanager
+def _skip_weight_init():
+    """No-op torch.nn.init.* (used by both torch's default layer inits and DreamZero's own) while
+    building a model whose every weight the checkpoint then overwrites -- ~6min of CPU init per rank."""
+    names = [n for n in dir(torch.nn.init) if n.endswith("_") and not n.startswith("_")]
+    saved = {n: getattr(torch.nn.init, n) for n in names}
+    for n in names:
+        setattr(torch.nn.init, n, lambda tensor, *a, **k: tensor)
+    try:
+        yield
+    finally:
+        for n, fn in saved.items():
+            setattr(torch.nn.init, n, fn)
+
+
 def _load_full_checkpoint(model, ckpt_dir: str) -> None:
     """Mirrors DreamZero's BaseExperiment.create_model: shards with strict=False, then deferred LoRA."""
     import json
@@ -124,13 +140,20 @@ def _load_full_checkpoint(model, ckpt_dir: str) -> None:
     single_path = os.path.join(ckpt_dir, "model.safetensors")
     if os.path.exists(index_path):
         with open(index_path) as f:
-            shards = sorted(set(json.load(f)["weight_map"].values()))
-        for shard in shards:
-            model.load_state_dict(load_file(os.path.join(ckpt_dir, shard)), strict=False)
+            shards = [os.path.join(ckpt_dir, s) for s in sorted(set(json.load(f)["weight_map"].values()))]
     elif os.path.exists(single_path):
-        model.load_state_dict(load_file(single_path), strict=False)
+        shards = [single_path]
     else:
         raise FileNotFoundError(f"no model.safetensors(.index.json) under {ckpt_dir}")
+    loaded = set()
+    for shard in shards:
+        sd = load_file(shard)
+        loaded |= sd.keys()
+        model.load_state_dict(sd, strict=False)
+    # Init was skipped, so any weight the checkpoint doesn't cover would be uninitialized memory.
+    missing = sorted(set(model.state_dict()) - loaded)
+    if missing:
+        raise RuntimeError(f"{ckpt_dir} is missing {len(missing)} model weights, e.g. {missing[:5]}")
     head = model.action_head
     if getattr(head.config, "defer_lora_injection", False):
         head.inject_lora_after_loading()
@@ -171,7 +194,8 @@ def build_policy_and_processor(data_cfg, overrides: DreamZeroConfigOverrides, tr
     torch.set_default_dtype(torch.bfloat16)
     t0 = time.time()
     try:
-        model = instantiate(cfg.model)
+        with _skip_weight_init() if overrides.pretrained_path else contextlib.nullcontext():
+            model = instantiate(cfg.model)
         t1 = time.time()
         if overrides.pretrained_path:
             _load_full_checkpoint(model, overrides.pretrained_path)
