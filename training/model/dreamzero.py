@@ -10,6 +10,7 @@ checkout so its YAML configs ship with it (a plain pip install drops them):
 """
 from __future__ import annotations
 
+import gc
 import os
 
 import numpy as np
@@ -154,12 +155,39 @@ def _unpack_block_outputs_without_grad(model) -> None:
         block.forward = forward
 
 
+def _return_plain_dict(model) -> None:
+    """VLA.forward returns a BatchFeature (a UserDict); DDP's _find_tensors only walks real dicts,
+    so it sees no outputs, marks every param unused, then backward marks them ready twice."""
+    orig = model.forward
+    model.forward = lambda *a, **k: dict(orig(*a, **k))
+
+
 def build_policy_and_processor(data_cfg, overrides: DreamZeroConfigOverrides, train_cfg, dataset_stats, device):
+    import torch.distributed as dist
+
+    # One local rank at a time: each CPU build peaks at a full fp32 copy (~80GB) before moving to GPU.
+    if not dist.is_initialized():
+        return _build(data_cfg, overrides, device)
+    import ray.train
+
+    ctx = ray.train.get_context()
+    model = None
+    for turn in range(ctx.get_local_world_size()):
+        if turn == ctx.get_local_rank():
+            model = _build(data_cfg, overrides, device)[0]
+            gc.collect()
+        dev = torch.device(device)
+        dist.barrier(device_ids=[dev.index] if dev.type == "cuda" else None)
+    return model, None
+
+
+def _build(data_cfg, overrides: DreamZeroConfigOverrides, device):
     from hydra.utils import instantiate
 
     cfg = compose_dreamzero_cfg(overrides, num_views=len(data_cfg.robot.camera_keys))
     model = instantiate(cfg.model)
     _unpack_block_outputs_without_grad(model)
+    _return_plain_dict(model)
     if overrides.pretrained_path:
         _load_full_checkpoint(model, overrides.pretrained_path)
     # DreamZero's head takes its working dtype from its first parameter and expects bf16

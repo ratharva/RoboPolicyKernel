@@ -84,9 +84,13 @@ datasets
 # hydra-core
 # peft>=0.18.0,<1.0.0
 # diffusers>=0.38.0,<0.40.0
-# torchcodec>=0.3.0,<0.12.0
+# torchcodec>=0.3.0,<0.12.0   (needs system FFmpeg 4-8 shared libs: apt-get install ffmpeg)
 # albumentations
 # ftfy
+# dm-tree
+# einops
+# regex
+# accelerate
 
 # Optional: only needed for --log-perf-metrics's GPU compute-utilization %
 # (torch.cuda.utilization()/memory_usage() both call into NVML under the

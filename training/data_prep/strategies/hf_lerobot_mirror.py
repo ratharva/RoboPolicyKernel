@@ -51,13 +51,16 @@ def build_ingestion_config(spec: dict) -> HfLerobotMirrorIngestionConfig:
 
 def _read_jsonl_prefix(fs, path: str, num_episodes: int) -> list[str]:
     """Raw lines for episode_index < num_episodes, streamed (episodes_stats.jsonl is ~1GB for DROID)."""
+    from tqdm import tqdm
+
     lines: list[str] = []
-    with fs.open(path, "r") as f:
+    with fs.open(path, "r") as f, tqdm(total=num_episodes, desc=f"trim {os.path.basename(path)}", unit="ep") as bar:
         for line in f:
             if not line.strip():
                 continue
             if json.loads(line)["episode_index"] < num_episodes:
                 lines.append(line if line.endswith("\n") else line + "\n")
+                bar.update(1)
                 if len(lines) == num_episodes:
                     break
     if len(lines) != num_episodes:
@@ -80,6 +83,7 @@ def _download_v21(repo_id: str, revision: str | None, root: str, max_episodes: i
     total = info["total_episodes"]
     meta = os.path.join(root, "meta")
     if max_episodes >= total:
+        print(f"[1/3] downloading all {total} episodes of {repo_id} (no subsetting)")
         snapshot_download(repo_id, repo_type="dataset", revision=revision, local_dir=root)
         n = total
     else:
@@ -91,8 +95,10 @@ def _download_v21(repo_id: str, revision: str | None, root: str, max_episodes: i
             chunk = ep // chunks_size
             files.append(info["data_path"].format(episode_chunk=chunk, episode_index=ep))
             files += [info["video_path"].format(episode_chunk=chunk, video_key=k, episode_index=ep) for k in video_keys]
+        print(f"[1/3] downloading first {n} of {total} episodes of {repo_id} ({len(files)} files)")
         snapshot_download(repo_id, repo_type="dataset", revision=revision, local_dir=root, allow_patterns=files)
 
+        print("[2/3] trimming metadata to the downloaded episodes")
         episodes = _read_jsonl_prefix(fs, f"{base}/meta/episodes.jsonl", n)
         with open(os.path.join(meta, "episodes.jsonl"), "w") as f:
             f.writelines(episodes)
@@ -132,6 +138,8 @@ def prepare(
         # Downloading ourselves pins the revision; convert_dataset's own download uses the v2.1 tag.
         n = _download_v21(target_repo_id, ingestion_cfg.revision, v3_root, max_episodes_per_task)
         print(f"downloaded {n} episode(s) of {target_repo_id} into {v3_root}")
+    print(f"[3/3] converting to LeRobot v3 with lerobot's convert_dataset (data files, then videos per camera)"
+          + ("" if os.path.exists(v3_root) else " -- downloads the whole repo first"))
     convert_dataset(repo_id=target_repo_id, root=v3_root, push_to_hub=False)
 
     params = compute_conversion_params(
