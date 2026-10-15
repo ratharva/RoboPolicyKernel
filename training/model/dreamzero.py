@@ -177,7 +177,8 @@ def build_policy_and_processor(data_cfg, overrides: DreamZeroConfigOverrides, tr
             model = _build(data_cfg, overrides, device)[0]
             gc.collect()
         dev = torch.device(device)
-        dist.barrier(device_ids=[dev.index] if dev.type == "cuda" else None)
+        idx = dev.index if dev.index is not None else torch.cuda.current_device()
+        dist.barrier(device_ids=[idx] if dev.type == "cuda" else None)
     return model, None
 
 
