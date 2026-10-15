@@ -26,7 +26,9 @@ import os
 from dataclasses import dataclass
 
 from training.common.robots import RobotSchema
-from training.data_prep.lerobot_v3_writer import compute_conversion_params, write_conversion_params
+from training.data_prep.lerobot_v3_writer import (
+    CONVERSION_PARAMS_FILENAME, compute_conversion_params, wipe_dataset, write_conversion_params,
+)
 
 
 @dataclass
@@ -134,6 +136,12 @@ def prepare(
     from lerobot.scripts.convert_dataset_v21_to_v30 import convert_dataset
 
     target_repo_id = repo_id or ingestion_cfg.full_repo_id
+    if ingestion_cfg.source_format_version == "v2.1" and os.path.exists(v3_root):
+        # prepare_data only gets here when settings changed or --reconvert; convert_dataset can't redo a v3 root.
+        if not os.path.exists(os.path.join(v3_root, "meta", CONVERSION_PARAMS_FILENAME)):
+            raise SystemExit(f"{v3_root} exists but was never fully prepared (interrupted run?) -- delete it and rerun")
+        print(f"rebuilding {v3_root} (different settings than last time, or --reconvert)")
+        wipe_dataset(v3_root)
     if ingestion_cfg.source_format_version == "v2.1" and not os.path.exists(v3_root):
         # Downloading ourselves pins the revision; convert_dataset's own download uses the v2.1 tag.
         n = _download_v21(target_repo_id, ingestion_cfg.revision, v3_root, max_episodes_per_task)
