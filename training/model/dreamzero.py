@@ -11,6 +11,7 @@ checkout so its YAML configs ship with it (a plain pip install drops them):
 from __future__ import annotations
 
 import os
+import time
 
 import numpy as np
 import torch
@@ -168,12 +169,15 @@ def build_policy_and_processor(data_cfg, overrides: DreamZeroConfigOverrides, tr
     # Build and load straight in bf16 (half the CPU RAM of fp32); rope freqs use explicit float64.
     prev = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
+    t0 = time.time()
     try:
         model = instantiate(cfg.model)
+        t1 = time.time()
         if overrides.pretrained_path:
             _load_full_checkpoint(model, overrides.pretrained_path)
     finally:
         torch.set_default_dtype(prev)
+    t2 = time.time()
     _unpack_block_outputs_without_grad(model)
     _return_plain_dict(model)
     # DreamZero's head takes its working dtype from its first parameter and expects bf16
@@ -183,6 +187,7 @@ def build_policy_and_processor(data_cfg, overrides: DreamZeroConfigOverrides, tr
         if p.requires_grad:
             p.data = p.data.float()
     model.train()
+    print(f"  (dreamzero build: instantiate {t1 - t0:.0f}s, checkpoint load {t2 - t1:.0f}s, to GPU {time.time() - t2:.0f}s)")
     return model, None
 
 
