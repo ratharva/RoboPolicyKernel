@@ -74,6 +74,20 @@ datasets
 # pip install 'lerobot[molmoact2]' also works and pulls in the same package.
 # peft
 
+# Optional: only for --policy-type dreamzero. DreamZero itself goes in as an editable checkout
+# pinned to training/model/dreamzero.py's DREAMZERO_COMMIT (a plain pip install drops its Hydra
+# YAML configs; --no-deps because it pins transformers 4.51/ray 2.47, and --ignore-requires-python
+# because it declares <3.13 -- both verified to work on this stack anyway):
+#   git clone https://github.com/dreamzero0/dreamzero && git -C dreamzero checkout <DREAMZERO_COMMIT>
+#   pip install --no-deps --ignore-requires-python -e dreamzero
+# Version ranges match lerobot==0.6.1's own extras for the shared packages.
+# hydra-core
+# peft>=0.18.0,<1.0.0
+# diffusers>=0.38.0,<0.40.0
+# torchcodec>=0.3.0,<0.12.0
+# albumentations
+# ftfy
+
 # Optional: only needed for --log-perf-metrics's GPU compute-utilization %
 # (torch.cuda.utilization()/memory_usage() both call into NVML under the
 # hood -- confirmed via a real ModuleNotFoundError from torch itself

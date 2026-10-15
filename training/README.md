@@ -517,6 +517,68 @@ matters). Validated so far only as a short-run speed/memory measurement
 yet confirmed stable (no NaN/divergence) over a long real training run.
 Confirm that before trusting it beyond a speed probe.
 
+## DreamZero
+
+[DreamZero](https://github.com/dreamzero0/dreamzero) (NVIDIA GEAR, Apache-2.0)
+is a 14B world action model on Wan2.1-I2V: it denoises future video latents
+and an action chunk together, so its loss is `dynamics_loss` (video) +
+`action_loss`. The model, its Hydra configs, and its `DreamTransform`/`collate`
+(view tiling, prompt template, umt5 tokenization, padding) are DreamZero's
+own code, called as-is. This repo adds the clip-window data path, the
+normalization and relative actions feeding that transform, and the Ray Train wiring.
+
+**Install** (same environment as the other policies -- verified on Python
+3.13, torch 2.11, transformers 5.5.4, peft 0.21, diffusers 0.39 despite
+DreamZero's own older pins):
+
+```bash
+git clone https://github.com/dreamzero0/dreamzero
+git -C dreamzero checkout ab790c198fbce33503358efbbd4187ce9a89adf3   # DREAMZERO_COMMIT
+pip install --no-deps --ignore-requires-python -e dreamzero          # editable: keeps its YAML configs
+pip install hydra-core "peft>=0.18,<1" "diffusers>=0.38,<0.40" "torchcodec>=0.3,<0.12" albumentations ftfy
+hf download Wan-AI/Wan2.1-I2V-14B-480P --local-dir checkpoints/Wan2.1-I2V-14B-480P
+hf download GEAR-Dreams/DreamZero-DROID --local-dir checkpoints/DreamZero-DROID
+```
+
+**One sample** (DreamZero's DROID recipe): an anchor frame plus 4 blocks of
+24 steps -- 33 frames per camera (8 per block at stride 3, plus 1), 96 actions,
+and the state at each block start. Read with Ray's own
+`ray.data.read_lerobot(delta_timestamps=...)`. Anchors are kept only where the
+whole window fits in the episode, every `--dreamzero-anchor-stride` frames.
+Episodes without an instruction, or with `is_episode_successful` false, are
+dropped, as in DreamZero's own DROID data. Joint actions are made relative to
+each block's starting state (`--dreamzero-relative-action-dims`). State and
+action are normalized with q01/q99 into [-1, 1].
+
+Differences from DreamZero's own loader: no idle-frame filtering, no
+backward window extension within a language segment, and no train-time
+video augmentation (crop, color jitter, dropped exterior view).
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--dreamzero-wan-ckpt-dir` | (required) | Wan2.1-I2V-14B-480P dir; DreamZero loads umt5/CLIP/VAE from it |
+| `--dreamzero-pretrained-path` | none | full DreamZero checkpoint dir; empty = raw Wan backbone |
+| `--dreamzero-embodiment-tag` | dataset preset | projector slot (`oxe_droid`, `agibot`, `xdof`, ...); only `droid` has a preset |
+| `--dreamzero-relative-action-dims` | dataset preset | action dims minus the same-index state dim; `droid`: 0-6 |
+| `--dreamzero-train-mode` | `lora` | `lora` or `fft` |
+| `--dreamzero-anchor-stride` | `8` | each anchor decodes 33 frames per camera |
+| `--dreamzero-distributed-strategy` | `ddp` | `fsdp2` only with `fft` |
+| `--dreamzero-hydra-override` | none | extra DreamZero Hydra override, repeatable |
+
+```bash
+# Integration check: DreamZero-DROID on joint-space DROID with its own published stats
+python -m training.prepare_data --tasks droid_subset --dataset-source droid --max-episodes-per-task 300
+python -m training.tools.dreamzero_stats --out dreamzero_droid_stats.json
+python -m training.train --tasks droid_subset --policy-type dreamzero \
+    --dreamzero-wan-ckpt-dir checkpoints/Wan2.1-I2V-14B-480P \
+    --dreamzero-pretrained-path checkpoints/DreamZero-DROID \
+    --normalization-stats-source explicit_file --normalization-explicit-stats-file dreamzero_droid_stats.json \
+    --batch-size 1 --max-train-steps 200 --log-perf-metrics
+```
+
+`droid_100` is not usable for this check: its actions are Cartesian velocity,
+not the joint positions DreamZero-DROID was trained on.
+
 ## Overriding the dataset source / v3 root
 
 ```bash

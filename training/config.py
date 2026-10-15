@@ -186,6 +186,43 @@ class Pi05ConfigOverrides(PolicyOverrides):
     print_attn_impl: bool = False
 
 
+@PolicyOverrides.register_subclass("dreamzero")
+@dataclass
+class DreamZeroConfigOverrides(PolicyOverrides):
+    """DreamZero world action model (github.com/dreamzero0/dreamzero); see training/model/dreamzero.py.
+    Window defaults match DreamZero's own DROID recipe: 4 blocks x 24 actions, 8 frames/block at stride 3."""
+    pretrained_path: str = ""       # full DreamZero checkpoint dir (e.g. DreamZero-DROID / DreamZero-AgiBot)
+    wan_ckpt_dir: str = ""          # Wan2.1-I2V-14B-480P dir: DiT + umt5/CLIP/VAE weights
+    tokenizer_path: str = "google/umt5-xxl"
+    embodiment_tag: str = ""        # DreamZero projector slot; "" = preset for this dataset_source
+    relative_action_dims: list[int] | None = None   # None = preset; action dims made relative to block-start state
+    train_mode: str = "lora"        # "lora" | "fft"
+    lora_rank: int = 4
+    lora_alpha: int = 4
+    num_blocks: int = 4
+    action_per_block: int = 24
+    frame_stride: int = 3
+    image_height: int = 176
+    image_width: int = 320
+    max_state_dim: int = 64
+    max_action_dim: int = 32
+    anchor_stride: int = 8          # keep every Nth window anchor (each anchor decodes num_blocks*8+1 frames per camera)
+    require_success: bool = True    # drop episodes whose is_episode_successful column is False (if present)
+    hydra_overrides: list[str] = field(default_factory=list)  # extra DreamZero Hydra overrides, applied last
+    distributed_strategy: str = "ddp"   # "ddp" | "fsdp2"
+    fsdp_cpu_offload: bool = False
+    fsdp_state_dict_type: str = "sharded_state_dict"
+    preprocess_concurrency: int | None = None   # Ray Data actor pool size for DreamZero's transform; None = auto
+
+    @property
+    def chunk_size(self) -> int:
+        return self.num_blocks * self.action_per_block
+
+    @property
+    def n_action_steps(self) -> int:
+        return self.chunk_size
+
+
 @dataclass
 class TrainConfig:
     num_epochs: int = 1

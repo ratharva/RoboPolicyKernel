@@ -26,7 +26,9 @@ import ray.train.torch
 import torch
 
 from training.common.ray_setup import build_runtime_env, connect_ray
-from training.config import ACTConfigOverrides, MolmoAct2ConfigOverrides, Pi05ConfigOverrides, RunConfig
+from training.config import (
+    ACTConfigOverrides, DreamZeroConfigOverrides, MolmoAct2ConfigOverrides, Pi05ConfigOverrides, RunConfig,
+)
 from training.data.ray_dataset import (
     build_lerobot_v3_dataset, offload_molmoact2_preprocessing, select_action_space,
     to_relative_action_space, transpose_for_training,
@@ -60,7 +62,86 @@ def _parse_kv_pairs(pairs: list[str] | None, value_type=str) -> dict:
 # in values nothing else was explicitly passed for.
 _POLICY_MODEL_CLASSES = {
     "act": ACTConfigOverrides, "molmoact2": MolmoAct2ConfigOverrides, "pi05": Pi05ConfigOverrides,
+    "dreamzero": DreamZeroConfigOverrides,
 }
+
+
+def _build_dreamzero_data(args, run_cfg: RunConfig, v3_root: str, dataset_source: str, cpus: int):
+    """Clip-window data path for DreamZero (training/model/dreamzero.py). Each split is read
+    straight from its own episode list, so no video is decoded just to be filtered away.
+    Returns (ds, val_ds, test_ds, dataset_stats, val_episode_indices, test_episode_indices)."""
+    import json
+
+    import fsspec
+
+    from training.data.ray_dataset import bucket_episodes, build_clip_window_dataset, offload_dreamzero_preprocessing
+    from training.model import dreamzero
+
+    o, robot = run_cfg.model, run_cfg.data.robot
+    tag, rel_dims = dreamzero.resolve_embodiment(o, dataset_source)
+    if rel_dims and max(rel_dims) >= min(robot.state_dim, robot.action_dim):
+        raise SystemExit(f"--dreamzero-relative-action-dims {rel_dims} out of range for state_dim="
+                         f"{robot.state_dim}, action_dim={robot.action_dim}")
+    if robot.state_dim > o.max_state_dim or robot.action_dim > o.max_action_dim:
+        raise SystemExit(f"state_dim={robot.state_dim}/action_dim={robot.action_dim} exceed DreamZero's "
+                         f"max_state_dim={o.max_state_dim}/max_action_dim={o.max_action_dim}")
+    cams = [f"observation.images.{k}" for k in robot.camera_keys]
+    steps = {c: dreamzero.video_steps(o) for c in cams}
+    steps["action"] = list(range(o.chunk_size))
+    steps["observation.state"] = dreamzero.state_steps(o)
+    print(f"  DreamZero embodiment={tag} relative_action_dims={rel_dims} frames/window={len(dreamzero.video_steps(o))} "
+          f"actions/window={o.chunk_size} anchor_stride={o.anchor_stride}")
+
+    episodes = dreamzero.valid_episodes(v3_root, o.require_success)
+    print(f"  {len(episodes)} episode(s) with an instruction{' and success flag' if o.require_success else ''}")
+    val_frac = run_cfg.train.val_split_fraction if not args.val_v3_root else None
+    test_frac = run_cfg.train.test_split_fraction if not args.test_v3_root else None
+    train_eps, val_eps, test_eps = episodes, [], []
+    if val_frac or test_frac:
+        b = bucket_episodes(episodes, seed=0, val_fraction=val_frac or 0, test_fraction=test_frac or 0)
+        train_eps, val_eps, test_eps = b["train"], b["val"], b["test"]
+        if not train_eps:
+            raise SystemExit("val/test split fractions left no DreamZero training episodes")
+
+    norm = run_cfg.data.normalization
+    if norm.stats_source == "explicit_file":
+        if not norm.explicit_stats_file:
+            raise SystemExit("--normalization-stats-source explicit_file needs --normalization-explicit-stats-file")
+        with fsspec.open(norm.explicit_stats_file) as f:
+            stats = json.load(f)
+    elif norm.stats_source == "dataset":
+        stats = dreamzero.compute_dreamzero_stats(v3_root, train_eps, o, rel_dims)
+    else:
+        raise SystemExit("DreamZero supports --normalization-stats-source dataset or explicit_file only")
+    for key, dim in (("observation.state", robot.state_dim), ("action", robot.action_dim)):
+        for q in ("q01", "q99"):
+            if len(stats.get(key, {}).get(q, [])) != dim:
+                raise SystemExit(f"DreamZero stats {key}.{q} must have {dim} values")
+    o.resolved_normalization_mode = {"VISUAL": "IDENTITY", "STATE": "QUANTILES", "ACTION": "QUANTILES"}
+
+    concurrency = o.preprocess_concurrency or max(1, cpus // 4)
+
+    def _split(root: str, eps: list[int], suffix: str):
+        name = run_cfg.run_name + suffix
+        ds = build_clip_window_dataset(root, steps, robot.tick_fps, eps, o.anchor_stride, pad_key="action", name=name)
+        return offload_dreamzero_preprocessing(ds, cams, o, tag, rel_dims, stats, concurrency=concurrency, name=name)
+
+    def _side(kind: str, root: str | None, eps: list[int]):
+        if root:
+            side_source = (read_conversion_params(root) or {}).get("dataset_source")
+            side = get_dataset_source(side_source).robot if side_source else None
+            if side is None or (side.camera_keys, side.state_dim, side.action_dim) != (
+                robot.camera_keys, robot.state_dim, robot.action_dim
+            ):
+                raise SystemExit(f"--{kind}-v3-root {root} doesn't match the training root's cameras/state/action")
+            eps = dreamzero.valid_episodes(root, o.require_success)
+            return _split(root, eps, f"-{kind}"), eps
+        return (_split(v3_root, eps, f"-{kind}"), eps) if eps else (None, None)
+
+    val_ds, val_eps = _side("val", args.val_v3_root, val_eps)
+    test_ds, test_eps = _side("test", args.test_v3_root, test_eps)
+    print(f"  train episodes: {len(train_eps)}, val: {len(val_eps or [])}, test: {len(test_eps or [])}")
+    return _split(v3_root, train_eps, ""), val_ds, test_ds, stats, val_eps, test_eps
 
 
 def _apply_if_explicit(
@@ -350,11 +431,12 @@ def main() -> None:
                               "ceiling to clip/scale by (e.g. max depth in millimeters); no guessed default")
 
     # --- MolmoAct2 ---
-    parser.add_argument("--policy-type", choices=("act", "molmoact2", "pi05"), required=True,
+    parser.add_argument("--policy-type", choices=("act", "molmoact2", "pi05", "dreamzero"), required=True,
                          help="which policy family to train -- act (this repo's original "
                               "lightweight policy, trains from random init), molmoact2 (~8B-param VLA), "
-                              "or pi05 (~3.2-3.3B-param VLA, needs --pi05-pretrained-path) -- all three "
-                              "share the same lerobot install, see README")
+                              "pi05 (~3.2-3.3B-param VLA, needs --pi05-pretrained-path), or dreamzero "
+                              "(14B world action model, needs a DreamZero editable install -- see "
+                              "training/model/dreamzero.py)")
     parser.add_argument("--molmoact2-checkpoint-path", default="allenai/MolmoAct2",
                          help="HF repo id or local path MolmoAct2's VLM backbone loads from")
     parser.add_argument("--molmoact2-setup-type", default="",
@@ -489,6 +571,32 @@ def main() -> None:
     parser.add_argument("--pi05-revision", default=None,
                          help="pins both weight loading and normalization-config loading to a specific "
                               "Hub revision/commit/tag -- default: the Hub's latest")
+
+    # --- DreamZero (training/model/dreamzero.py) ---
+    parser.add_argument("--dreamzero-pretrained-path", default="",
+                         help="full DreamZero checkpoint dir (e.g. DreamZero-DROID, DreamZero-AgiBot); "
+                              "empty = start from the raw Wan backbone")
+    parser.add_argument("--dreamzero-wan-ckpt-dir", default="",
+                         help="Wan2.1-I2V-14B-480P dir (DiT + umt5/CLIP/VAE weights) -- required")
+    parser.add_argument("--dreamzero-tokenizer-path", default="google/umt5-xxl")
+    parser.add_argument("--dreamzero-embodiment-tag", default="",
+                         help="DreamZero projector slot (e.g. oxe_droid, agibot, xdof) -- default: preset for "
+                              "the dataset_source (only droid has one)")
+    parser.add_argument("--dreamzero-relative-action-dims", type=int, nargs="*", default=None,
+                         help="action dims made relative to the block-start state (same index in state)")
+    parser.add_argument("--dreamzero-train-mode", choices=("lora", "fft"), default="lora")
+    parser.add_argument("--dreamzero-lora-rank", type=int, default=4)
+    parser.add_argument("--dreamzero-lora-alpha", type=int, default=4)
+    parser.add_argument("--dreamzero-anchor-stride", type=int, default=8,
+                         help="keep every Nth window anchor -- each anchor decodes 33 frames per camera")
+    parser.add_argument("--dreamzero-no-require-success", dest="dreamzero_require_success", action="store_false",
+                         help="keep episodes whose is_episode_successful column is False")
+    parser.add_argument("--dreamzero-hydra-override", dest="dreamzero_hydra_overrides", action="append",
+                         default=[], help="extra DreamZero Hydra override (repeatable), applied last")
+    parser.add_argument("--dreamzero-distributed-strategy", choices=("ddp", "fsdp2"), default="ddp")
+    parser.add_argument("--dreamzero-fsdp-cpu-offload", action="store_true")
+    parser.add_argument("--dreamzero-preprocess-concurrency", type=int, default=None,
+                         help="Ray Data actor pool size for DreamZero's transform -- default: CPUs/4")
     args = parser.parse_args()
 
     # Policy-specific "required iff"/cross-field validation moved below,
@@ -706,6 +814,28 @@ def main() -> None:
                 "in --config-file's model section)"
             )
 
+    if run_cfg.policy_type == "dreamzero":
+        m = run_cfg.model
+        _apply_if_explicit(m, "pretrained_path", args, "dreamzero_pretrained_path", parser)
+        _apply_if_explicit(m, "wan_ckpt_dir", args, "dreamzero_wan_ckpt_dir", parser)
+        _apply_if_explicit(m, "tokenizer_path", args, "dreamzero_tokenizer_path", parser)
+        _apply_if_explicit(m, "embodiment_tag", args, "dreamzero_embodiment_tag", parser)
+        _apply_if_explicit(m, "relative_action_dims", args, "dreamzero_relative_action_dims", parser)
+        _apply_if_explicit(m, "train_mode", args, "dreamzero_train_mode", parser)
+        _apply_if_explicit(m, "lora_rank", args, "dreamzero_lora_rank", parser)
+        _apply_if_explicit(m, "lora_alpha", args, "dreamzero_lora_alpha", parser)
+        _apply_if_explicit(m, "anchor_stride", args, "dreamzero_anchor_stride", parser)
+        _apply_if_explicit(m, "require_success", args, "dreamzero_require_success", parser)
+        _apply_if_explicit(m, "hydra_overrides", args, "dreamzero_hydra_overrides", parser)
+        _apply_if_explicit(m, "distributed_strategy", args, "dreamzero_distributed_strategy", parser)
+        _apply_if_explicit(m, "fsdp_cpu_offload", args, "dreamzero_fsdp_cpu_offload", parser)
+        _apply_if_explicit(m, "preprocess_concurrency", args, "dreamzero_preprocess_concurrency", parser)
+        if not m.wan_ckpt_dir:
+            parser.error("--dreamzero-wan-ckpt-dir is required for --policy-type dreamzero (DreamZero loads its "
+                         "umt5/CLIP/VAE weights from it, downloading ~45GB itself if it's missing)")
+        if m.distributed_strategy == "fsdp2" and m.train_mode != "fft":
+            parser.error("--dreamzero-distributed-strategy fsdp2 only makes sense with --dreamzero-train-mode fft")
+
     # --- image-normalization default: an adapter's preferred_visual_normalization
     # (e.g. pi05's "unit01") wins over DataConfig.default_image_normalization's
     # own default ("mean_std") unless --image-normalization-default was
@@ -746,6 +876,12 @@ def main() -> None:
         parser.error("normalization mode_source must be 'explicit' or 'checkpoint'")
     if run_cfg.data.normalization.stats_source not in ("dataset", "checkpoint", "explicit_file"):
         parser.error("normalization stats_source must be 'dataset', 'checkpoint', or 'explicit_file'")
+    if run_cfg.policy_type == "dreamzero":
+        if run_cfg.data.action_space is not None or run_cfg.data.action_representation != "absolute":
+            parser.error("--action-space/--action-representation don't apply to dreamzero -- its relative "
+                         "actions come from --dreamzero-relative-action-dims")
+        if run_cfg.data.normalization.mode_source == "checkpoint" or run_cfg.data.normalization.stats_source == "checkpoint":
+            parser.error("dreamzero always uses q01/q99 from the dataset or an explicit stats file")
 
     _apply_if_explicit(run_cfg, "storage_root", args, "storage_root", parser)
     run_cfg.storage_root = os.path.abspath(run_cfg.storage_root)
@@ -862,193 +998,199 @@ def main() -> None:
         print("WARNING: Ray reports GPUs but this driver process sees none -- check CUDA setup.")
 
     print("\n=== build Ray Data pipeline (from LeRobot v3) ===")
-    raw_ds = build_lerobot_v3_dataset(
-        v3_root, run_cfg.model.chunk_size, depth_camera_keys=run_cfg.data.robot.depth_camera_keys,
-    )
-    raw_ds = select_action_space(raw_ds, original_robot, run_cfg.data.robot, name=run_cfg.run_name)
-    if run_cfg.data.action_representation == "delta":
-        raw_ds = to_relative_action_space(
-            raw_ds, run_cfg.data.robot, exclude_components=run_cfg.data.action_delta_exclude,
-            name=run_cfg.run_name,
+    if run_cfg.policy_type == "dreamzero":
+        ds, val_ds, test_ds, dataset_stats, val_episode_indices, test_episode_indices = _build_dreamzero_data(
+            args, run_cfg, v3_root, dataset_source, int(resources.get("CPU", 1)),
         )
-
-    # Held-out val/test split -- held out of TRAINING entirely, including
-    # normalization stats below (computing stats from episodes the val/test
-    # pass then scores against would leak information the held-out set is
-    # supposed to be free of). Two independent mechanisms per side, already
-    # validated mutually exclusive above: a hash-based slice of THIS root
-    # (--val-split-fraction/--test-split-fraction) or a wholly separate,
-    # already-prepared v3 root (--val-v3-root/--test-v3-root).
-    val_raw_ds = test_raw_ds = None
-    val_episode_indices = test_episode_indices = None
-
-    slice_val_fraction = run_cfg.train.val_split_fraction if not args.val_v3_root else None
-    slice_test_fraction = run_cfg.train.test_split_fraction if not args.test_v3_root else None
-    if slice_val_fraction or slice_test_fraction:
-        from training.data.ray_dataset import bucket_episodes, split_by_episode
-        from training.vendor.lerobot_datasource import LeRobotDatasourceMetadata
-
-        meta = LeRobotDatasourceMetadata(v3_root)
-        all_episode_indices = meta.episodes.column("episode_index").to_pylist()
-        # Pure-Python bucketing (same hash split_by_episode uses internally)
-        # just to size/validate the split and get val's episode-index list
-        # for train_loop.py's GIF sampling -- no Ray Data touched here.
-        buckets = bucket_episodes(
-            all_episode_indices, seed=0,
-            val_fraction=slice_val_fraction or 0, test_fraction=slice_test_fraction or 0,
+        _mark_phase("build DreamZero clip-window pipeline + stats")
+    else:
+        raw_ds = build_lerobot_v3_dataset(
+            v3_root, run_cfg.model.chunk_size, depth_camera_keys=run_cfg.data.robot.depth_camera_keys,
         )
-        if slice_val_fraction and not buckets["val"]:
-            raise SystemExit(
-                f"--val-split-fraction {slice_val_fraction} hashed 0/{len(all_episode_indices)} "
-                f"episode(s) to val -- try a different fraction, or use more episodes."
-            )
-        if slice_test_fraction and not buckets["test"]:
-            raise SystemExit(
-                f"--test-split-fraction {slice_test_fraction} hashed 0/{len(all_episode_indices)} "
-                f"episode(s) to test -- try a different fraction, or use more episodes."
-            )
-        if not buckets["train"]:
-            raise SystemExit(
-                f"--val-split-fraction {slice_val_fraction}/--test-split-fraction {slice_test_fraction} "
-                f"hashed ALL {len(all_episode_indices)} episode(s) out of training -- try smaller fractions."
-            )
-        if slice_val_fraction:
-            val_episode_indices = buckets["val"]
-            print(f"  val split: {len(buckets['val'])}/{len(all_episode_indices)} episodes held out of "
-                  f"training (--val-split-fraction {slice_val_fraction})")
-        if slice_test_fraction:
-            test_episode_indices = buckets["test"]
-            print(f"  test split: {len(buckets['test'])}/{len(all_episode_indices)} episodes held out of "
-                  f"training (--test-split-fraction {slice_test_fraction})")
-        raw_ds, val_raw_ds, test_raw_ds = split_by_episode(
-            raw_ds, slice_val_fraction or 0, slice_test_fraction or 0, seed=0,
-        )
-
-    def _resolve_side_v3_root(kind: str, side_v3_root: str) -> tuple["ray.data.Dataset", list[int]]:
-        """--val-v3-root/--test-v3-root: resolves the side root's own
-        RobotSchema the same way the training root's is resolved above,
-        checks it's compatible enough to share this run's policy/collate
-        path, then builds its Dataset via the SAME build_lerobot_v3_dataset/
-        select_action_space/to_relative_action_space calls the training
-        root already goes through -- ALL of its episodes are used (no hash
-        filtering; the operator chose this root specifically to be the
-        val/test set)."""
-        side_conversion_params = read_conversion_params(side_v3_root)
-        side_dataset_source = (side_conversion_params or {}).get("dataset_source")
-        if not side_dataset_source:
-            raise SystemExit(
-                f"--{kind}-v3-root {side_v3_root}'s conversion_params.json doesn't record a "
-                f"dataset_source (likely a hand-built v3 root) -- can't resolve its schema."
-            )
-        side_robot = get_dataset_source(side_dataset_source).robot
-        # camera_keys/depth_camera_keys/state_components/action_components
-        # feed the same policy/collate path as the training root's -- a
-        # mismatch would break forward_loss/collate on this side. tick_fps
-        # only affects real-world timing semantics, not structure -- warn only.
-        mismatches = {
-            k: (getattr(original_robot, k), getattr(side_robot, k))
-            for k in ("camera_keys", "depth_camera_keys", "state_components", "action_components")
-            if getattr(original_robot, k) != getattr(side_robot, k)
-        }
-        if mismatches:
-            raise SystemExit(
-                f"--{kind}-v3-root {side_v3_root}'s schema doesn't match the training root's: "
-                + "; ".join(f"{k} train={v[0]!r} {kind}={v[1]!r}" for k, v in mismatches.items())
-            )
-        if original_robot.tick_fps != side_robot.tick_fps:
-            print(
-                f"WARNING: --{kind}-v3-root {side_v3_root} has tick_fps={side_robot.tick_fps}, training "
-                f"root has tick_fps={original_robot.tick_fps} -- real-world timing semantics differ."
-            )
-        # Imported here, not reused from the fraction-split branch above --
-        # this helper runs whenever --val-v3-root/--test-v3-root is passed,
-        # independently of whether a percentage split was also requested
-        # (the two are mutually exclusive per side, so that branch may
-        # never have run at all).
-        from training.vendor.lerobot_datasource import LeRobotDatasourceMetadata
-
-        side_meta = LeRobotDatasourceMetadata(side_v3_root)
-        side_episode_indices = side_meta.episodes.column("episode_index").to_pylist()
-        side_raw_ds = build_lerobot_v3_dataset(
-            side_v3_root, run_cfg.model.chunk_size, depth_camera_keys=run_cfg.data.robot.depth_camera_keys,
-        )
-        side_raw_ds = select_action_space(
-            side_raw_ds, side_robot, run_cfg.data.robot, name=f"{run_cfg.run_name}-{kind}",
-        )
+        raw_ds = select_action_space(raw_ds, original_robot, run_cfg.data.robot, name=run_cfg.run_name)
         if run_cfg.data.action_representation == "delta":
-            side_raw_ds = to_relative_action_space(
-                side_raw_ds, run_cfg.data.robot, exclude_components=run_cfg.data.action_delta_exclude,
-                name=f"{run_cfg.run_name}-{kind}",
+            raw_ds = to_relative_action_space(
+                raw_ds, run_cfg.data.robot, exclude_components=run_cfg.data.action_delta_exclude,
+                name=run_cfg.run_name,
             )
-        return side_raw_ds, side_episode_indices
 
-    if args.val_v3_root:
-        val_raw_ds, val_episode_indices = _resolve_side_v3_root("val", args.val_v3_root)
-        print(f"  val split: {len(val_episode_indices)} episode(s) from separate --val-v3-root {args.val_v3_root}")
-    if args.test_v3_root:
-        test_raw_ds, test_episode_indices = _resolve_side_v3_root("test", args.test_v3_root)
-        print(f"  test split: {len(test_episode_indices)} episode(s) from separate --test-v3-root {args.test_v3_root}")
+        # Held-out val/test split -- held out of TRAINING entirely, including
+        # normalization stats below (computing stats from episodes the val/test
+        # pass then scores against would leak information the held-out set is
+        # supposed to be free of). Two independent mechanisms per side, already
+        # validated mutually exclusive above: a hash-based slice of THIS root
+        # (--val-split-fraction/--test-split-fraction) or a wholly separate,
+        # already-prepared v3 root (--val-v3-root/--test-v3-root).
+        val_raw_ds = test_raw_ds = None
+        val_episode_indices = test_episode_indices = None
 
-    _mark_phase("build Ray Data pipeline (from LeRobot v3)")
-    print("\n=== compute normalization stats ===")
-    # Sampled from raw_ds (pre-transpose, HWC), AFTER action-space selection/
-    # delta-conversion/val-test-split above -- so stats reflect whatever's
-    # actually trained on (computing stats on absolute actions then
-    # converting to delta afterwards would normalize deltas using
-    # absolute-action mean/std, which is wrong; same reasoning for
-    # excluding the held-out val/test episodes). Unaffected by a root-based
-    # val/test -- that data was never part of raw_ds to begin with. See
-    # training/data/stats.py.
-    dataset_stats = compute_dataset_stats(raw_ds, run_cfg.data)
+        slice_val_fraction = run_cfg.train.val_split_fraction if not args.val_v3_root else None
+        slice_test_fraction = run_cfg.train.test_split_fraction if not args.test_v3_root else None
+        if slice_val_fraction or slice_test_fraction:
+            from training.data.ray_dataset import bucket_episodes, split_by_episode
+            from training.vendor.lerobot_datasource import LeRobotDatasourceMetadata
 
-    # STATE/ACTION normalization mode+stats resolution -- no-op when
-    # run_cfg.data.normalization is left at its defaults. See
-    # training/model/normalization.py.
-    from training.model.normalization import resolve_normalization, validate_normalization
+            meta = LeRobotDatasourceMetadata(v3_root)
+            all_episode_indices = meta.episodes.column("episode_index").to_pylist()
+            # Pure-Python bucketing (same hash split_by_episode uses internally)
+            # just to size/validate the split and get val's episode-index list
+            # for train_loop.py's GIF sampling -- no Ray Data touched here.
+            buckets = bucket_episodes(
+                all_episode_indices, seed=0,
+                val_fraction=slice_val_fraction or 0, test_fraction=slice_test_fraction or 0,
+            )
+            if slice_val_fraction and not buckets["val"]:
+                raise SystemExit(
+                    f"--val-split-fraction {slice_val_fraction} hashed 0/{len(all_episode_indices)} "
+                    f"episode(s) to val -- try a different fraction, or use more episodes."
+                )
+            if slice_test_fraction and not buckets["test"]:
+                raise SystemExit(
+                    f"--test-split-fraction {slice_test_fraction} hashed 0/{len(all_episode_indices)} "
+                    f"episode(s) to test -- try a different fraction, or use more episodes."
+                )
+            if not buckets["train"]:
+                raise SystemExit(
+                    f"--val-split-fraction {slice_val_fraction}/--test-split-fraction {slice_test_fraction} "
+                    f"hashed ALL {len(all_episode_indices)} episode(s) out of training -- try smaller fractions."
+                )
+            if slice_val_fraction:
+                val_episode_indices = buckets["val"]
+                print(f"  val split: {len(buckets['val'])}/{len(all_episode_indices)} episodes held out of "
+                      f"training (--val-split-fraction {slice_val_fraction})")
+            if slice_test_fraction:
+                test_episode_indices = buckets["test"]
+                print(f"  test split: {len(buckets['test'])}/{len(all_episode_indices)} episodes held out of "
+                      f"training (--test-split-fraction {slice_test_fraction})")
+            raw_ds, val_raw_ds, test_raw_ds = split_by_episode(
+                raw_ds, slice_val_fraction or 0, slice_test_fraction or 0, seed=0,
+            )
 
-    resolved_normalization = resolve_normalization(run_cfg.data, run_cfg.policy_type, run_cfg.model, raw_ds)
-    validate_normalization(
-        resolved_normalization, run_cfg.data, run_cfg.data.robot, run_cfg.policy_type, run_cfg.model,
-    )
-    if resolved_normalization.stats:
-        for key, val in resolved_normalization.stats.items():
-            dataset_stats[key] = val
-    if resolved_normalization.mode is not None:
-        run_cfg.model.resolved_normalization_mode = resolved_normalization.mode
+        def _resolve_side_v3_root(kind: str, side_v3_root: str) -> tuple["ray.data.Dataset", list[int]]:
+            """--val-v3-root/--test-v3-root: resolves the side root's own
+            RobotSchema the same way the training root's is resolved above,
+            checks it's compatible enough to share this run's policy/collate
+            path, then builds its Dataset via the SAME build_lerobot_v3_dataset/
+            select_action_space/to_relative_action_space calls the training
+            root already goes through -- ALL of its episodes are used (no hash
+            filtering; the operator chose this root specifically to be the
+            val/test set)."""
+            side_conversion_params = read_conversion_params(side_v3_root)
+            side_dataset_source = (side_conversion_params or {}).get("dataset_source")
+            if not side_dataset_source:
+                raise SystemExit(
+                    f"--{kind}-v3-root {side_v3_root}'s conversion_params.json doesn't record a "
+                    f"dataset_source (likely a hand-built v3 root) -- can't resolve its schema."
+                )
+            side_robot = get_dataset_source(side_dataset_source).robot
+            # camera_keys/depth_camera_keys/state_components/action_components
+            # feed the same policy/collate path as the training root's -- a
+            # mismatch would break forward_loss/collate on this side. tick_fps
+            # only affects real-world timing semantics, not structure -- warn only.
+            mismatches = {
+                k: (getattr(original_robot, k), getattr(side_robot, k))
+                for k in ("camera_keys", "depth_camera_keys", "state_components", "action_components")
+                if getattr(original_robot, k) != getattr(side_robot, k)
+            }
+            if mismatches:
+                raise SystemExit(
+                    f"--{kind}-v3-root {side_v3_root}'s schema doesn't match the training root's: "
+                    + "; ".join(f"{k} train={v[0]!r} {kind}={v[1]!r}" for k, v in mismatches.items())
+                )
+            if original_robot.tick_fps != side_robot.tick_fps:
+                print(
+                    f"WARNING: --{kind}-v3-root {side_v3_root} has tick_fps={side_robot.tick_fps}, training "
+                    f"root has tick_fps={original_robot.tick_fps} -- real-world timing semantics differ."
+                )
+            # Imported here, not reused from the fraction-split branch above --
+            # this helper runs whenever --val-v3-root/--test-v3-root is passed,
+            # independently of whether a percentage split was also requested
+            # (the two are mutually exclusive per side, so that branch may
+            # never have run at all).
+            from training.vendor.lerobot_datasource import LeRobotDatasourceMetadata
 
-    ds = transpose_for_training(
-        raw_ds, run_cfg.data.robot.camera_keys, name=run_cfg.run_name,
-        depth_camera_keys=run_cfg.data.robot.depth_camera_keys,
-    )
-    val_ds = test_ds = None
-    if val_raw_ds is not None:
-        val_ds = transpose_for_training(
-            val_raw_ds, run_cfg.data.robot.camera_keys, name=f"{run_cfg.run_name}-val",
+            side_meta = LeRobotDatasourceMetadata(side_v3_root)
+            side_episode_indices = side_meta.episodes.column("episode_index").to_pylist()
+            side_raw_ds = build_lerobot_v3_dataset(
+                side_v3_root, run_cfg.model.chunk_size, depth_camera_keys=run_cfg.data.robot.depth_camera_keys,
+            )
+            side_raw_ds = select_action_space(
+                side_raw_ds, side_robot, run_cfg.data.robot, name=f"{run_cfg.run_name}-{kind}",
+            )
+            if run_cfg.data.action_representation == "delta":
+                side_raw_ds = to_relative_action_space(
+                    side_raw_ds, run_cfg.data.robot, exclude_components=run_cfg.data.action_delta_exclude,
+                    name=f"{run_cfg.run_name}-{kind}",
+                )
+            return side_raw_ds, side_episode_indices
+
+        if args.val_v3_root:
+            val_raw_ds, val_episode_indices = _resolve_side_v3_root("val", args.val_v3_root)
+            print(f"  val split: {len(val_episode_indices)} episode(s) from separate --val-v3-root {args.val_v3_root}")
+        if args.test_v3_root:
+            test_raw_ds, test_episode_indices = _resolve_side_v3_root("test", args.test_v3_root)
+            print(f"  test split: {len(test_episode_indices)} episode(s) from separate --test-v3-root {args.test_v3_root}")
+
+        _mark_phase("build Ray Data pipeline (from LeRobot v3)")
+        print("\n=== compute normalization stats ===")
+        # Sampled from raw_ds (pre-transpose, HWC), AFTER action-space selection/
+        # delta-conversion/val-test-split above -- so stats reflect whatever's
+        # actually trained on (computing stats on absolute actions then
+        # converting to delta afterwards would normalize deltas using
+        # absolute-action mean/std, which is wrong; same reasoning for
+        # excluding the held-out val/test episodes). Unaffected by a root-based
+        # val/test -- that data was never part of raw_ds to begin with. See
+        # training/data/stats.py.
+        dataset_stats = compute_dataset_stats(raw_ds, run_cfg.data)
+
+        # STATE/ACTION normalization mode+stats resolution -- no-op when
+        # run_cfg.data.normalization is left at its defaults. See
+        # training/model/normalization.py.
+        from training.model.normalization import resolve_normalization, validate_normalization
+
+        resolved_normalization = resolve_normalization(run_cfg.data, run_cfg.policy_type, run_cfg.model, raw_ds)
+        validate_normalization(
+            resolved_normalization, run_cfg.data, run_cfg.data.robot, run_cfg.policy_type, run_cfg.model,
+        )
+        if resolved_normalization.stats:
+            for key, val in resolved_normalization.stats.items():
+                dataset_stats[key] = val
+        if resolved_normalization.mode is not None:
+            run_cfg.model.resolved_normalization_mode = resolved_normalization.mode
+
+        ds = transpose_for_training(
+            raw_ds, run_cfg.data.robot.camera_keys, name=run_cfg.run_name,
             depth_camera_keys=run_cfg.data.robot.depth_camera_keys,
         )
-    if test_raw_ds is not None:
-        test_ds = transpose_for_training(
-            test_raw_ds, run_cfg.data.robot.camera_keys, name=f"{run_cfg.run_name}-test",
-            depth_camera_keys=run_cfg.data.robot.depth_camera_keys,
-        )
+        val_ds = test_ds = None
+        if val_raw_ds is not None:
+            val_ds = transpose_for_training(
+                val_raw_ds, run_cfg.data.robot.camera_keys, name=f"{run_cfg.run_name}-val",
+                depth_camera_keys=run_cfg.data.robot.depth_camera_keys,
+            )
+        if test_raw_ds is not None:
+            test_ds = transpose_for_training(
+                test_raw_ds, run_cfg.data.robot.camera_keys, name=f"{run_cfg.run_name}-test",
+                depth_camera_keys=run_cfg.data.robot.depth_camera_keys,
+            )
 
-    if run_cfg.policy_type == "molmoact2" and run_cfg.model.offload_tokenization:
-        print("\n=== offload MolmoAct2 preprocessing (tokenizer + image processor) to Ray Data ===")
-        concurrency = args.molmoact2_offload_concurrency or max(1, int(resources.get("CPU", 1)) // 2)
-        ds = offload_molmoact2_preprocessing(
-            ds, run_cfg.data, run_cfg.model, run_cfg.train, dataset_stats,
-            concurrency=concurrency, name=run_cfg.run_name,
-        )
-        if val_ds is not None:
-            val_ds = offload_molmoact2_preprocessing(
-                val_ds, run_cfg.data, run_cfg.model, run_cfg.train, dataset_stats,
-                concurrency=concurrency, name=f"{run_cfg.run_name}-val",
+        if run_cfg.policy_type == "molmoact2" and run_cfg.model.offload_tokenization:
+            print("\n=== offload MolmoAct2 preprocessing (tokenizer + image processor) to Ray Data ===")
+            concurrency = args.molmoact2_offload_concurrency or max(1, int(resources.get("CPU", 1)) // 2)
+            ds = offload_molmoact2_preprocessing(
+                ds, run_cfg.data, run_cfg.model, run_cfg.train, dataset_stats,
+                concurrency=concurrency, name=run_cfg.run_name,
             )
-        if test_ds is not None:
-            test_ds = offload_molmoact2_preprocessing(
-                test_ds, run_cfg.data, run_cfg.model, run_cfg.train, dataset_stats,
-                concurrency=concurrency, name=f"{run_cfg.run_name}-test",
-            )
+            if val_ds is not None:
+                val_ds = offload_molmoact2_preprocessing(
+                    val_ds, run_cfg.data, run_cfg.model, run_cfg.train, dataset_stats,
+                    concurrency=concurrency, name=f"{run_cfg.run_name}-val",
+                )
+            if test_ds is not None:
+                test_ds = offload_molmoact2_preprocessing(
+                    test_ds, run_cfg.data, run_cfg.model, run_cfg.train, dataset_stats,
+                    concurrency=concurrency, name=f"{run_cfg.run_name}-test",
+                )
 
     if run_cfg.train.save_only_on_improvement:
         # A checkpoint is only attached when the loss improved, so every

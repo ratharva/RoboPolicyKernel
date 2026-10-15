@@ -427,3 +427,44 @@ def offload_molmoact2_preprocessing(
         },
     )
     return _set_name(ds, name)
+
+
+# ---------------------------------------------------------------------------
+# Multi-frame clip windows (world models, e.g. DreamZero) -- Ray's own
+# ray.data.read_lerobot with lerobot-style delta_timestamps, not the vendored
+# single-frame reader the other policies use.
+# ---------------------------------------------------------------------------
+
+
+def _full_window_on_stride(row: dict, pad_key: str, stride: int) -> bool:
+    return not np.asarray(row[pad_key]).any() and int(row["frame_index"]) % stride == 0
+
+
+def build_clip_window_dataset(
+    v3_root: str, delta_steps: dict[str, list[int]], fps: float, episodes: list[int],
+    anchor_stride: int, pad_key: str, name: str | None = None,
+) -> "ray.data.Dataset":
+    """One row per anchor frame; each key in delta_steps gains a leading time axis.
+    Keeps only anchors whose whole `pad_key` window lies inside the episode, every anchor_stride frames."""
+    delta_timestamps = {k: [s / fps for s in steps] for k, steps in delta_steps.items()}
+    ds = ray.data.read_lerobot(v3_root, episodes=episodes, delta_timestamps=delta_timestamps)
+    ds = ds.filter(_full_window_on_stride, fn_kwargs={"pad_key": f"{pad_key}_is_pad", "stride": anchor_stride})
+    return _set_name(ds, name)
+
+
+def offload_dreamzero_preprocessing(
+    ds: "ray.data.Dataset", camera_columns: list[str], overrides, embodiment_tag: str,
+    relative_action_dims: list[int], dataset_stats: dict, concurrency: int, name: str | None = None,
+) -> "ray.data.Dataset":
+    from training.model.dreamzero import DreamZeroPreprocessStage
+
+    ds = ds.map_batches(
+        DreamZeroPreprocessStage,
+        batch_size=2,  # each row is ~3 x 33 decoded frames
+        concurrency=concurrency,
+        fn_constructor_kwargs={
+            "camera_columns": camera_columns, "overrides": overrides, "embodiment_tag": embodiment_tag,
+            "relative_action_dims": relative_action_dims, "dataset_stats": dataset_stats,
+        },
+    )
+    return _set_name(ds, name)

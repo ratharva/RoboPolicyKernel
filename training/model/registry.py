@@ -116,6 +116,22 @@ def _pi05_adapter(distributed_strategy: str) -> PolicyAdapter:
     )
 
 
+def _dreamzero_adapter(distributed_strategy: str) -> PolicyAdapter:
+    from training.model import dreamzero
+    is_fsdp2 = distributed_strategy == "fsdp2"
+    return PolicyAdapter(
+        build=dreamzero.build_policy_and_processor,
+        forward_loss=dreamzero.forward_loss,
+        needs_task=True,
+        wrap_for_training=dreamzero.wrap_for_training if is_fsdp2 else None,
+        save_checkpoint=dreamzero.save_checkpoint if is_fsdp2 else None,
+        load_checkpoint=dreamzero.load_checkpoint if is_fsdp2 else None,
+        prepare_model_kwargs=None if is_fsdp2 else {"find_unused_parameters": True},
+        # Always offloaded: normalization, view tiling and tokenization run in a Ray Data stage.
+        preprocessing_offloaded=True,
+    )
+
+
 def get_adapter(policy_type: str, distributed_strategy: str = "ddp", offload_tokenization: bool = False) -> PolicyAdapter:
     if policy_type == "act":
         return _act_adapter()
@@ -123,4 +139,6 @@ def get_adapter(policy_type: str, distributed_strategy: str = "ddp", offload_tok
         return _molmoact2_adapter(distributed_strategy, offload_tokenization)
     if policy_type == "pi05":
         return _pi05_adapter(distributed_strategy)
-    raise ValueError(f"unknown policy_type {policy_type!r}, expected one of ('act', 'molmoact2', 'pi05')")
+    if policy_type == "dreamzero":
+        return _dreamzero_adapter(distributed_strategy)
+    raise ValueError(f"unknown policy_type {policy_type!r}, expected one of ('act', 'molmoact2', 'pi05', 'dreamzero')")

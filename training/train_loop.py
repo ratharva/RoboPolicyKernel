@@ -513,7 +513,10 @@ def train_loop_per_worker(config: dict) -> None:
     # (adapter.wrap_for_training) wraps model+optimizer together via
     # accelerator.prepare(), which rebinds the optimizer's param references
     # to the sharded parameters -- so the optimizer must exist first.
-    optim_params = policy.get_optim_params() if hasattr(policy, "get_optim_params") else policy.parameters()
+    optim_params = (
+        policy.get_optim_params() if hasattr(policy, "get_optim_params")
+        else [p for p in policy.parameters() if p.requires_grad]
+    )
     optimizer = torch.optim.AdamW(
         optim_params, lr=train_cfg.lr, weight_decay=train_cfg.weight_decay,
         betas=train_cfg.adam_betas, eps=train_cfg.adam_eps,
