@@ -535,7 +535,9 @@ DreamZero's own older pins):
 git clone https://github.com/dreamzero0/dreamzero
 git -C dreamzero checkout ab790c198fbce33503358efbbd4187ce9a89adf3   # DREAMZERO_COMMIT
 pip install --no-deps --ignore-requires-python -e dreamzero          # editable: keeps its YAML configs
-pip install hydra-core "peft>=0.18,<1" "diffusers>=0.38,<0.40" "torchcodec>=0.3,<0.12" albumentations ftfy
+pip install hydra-core "peft>=0.18,<1" "diffusers>=0.38,<0.40" "torchcodec>=0.3,<0.12" albumentations ftfy \
+    dm-tree einops regex accelerate
+sudo apt-get install -y ffmpeg                                       # torchcodec needs FFmpeg 4-8 shared libs
 hf download Wan-AI/Wan2.1-I2V-14B-480P --local-dir checkpoints/Wan2.1-I2V-14B-480P
 hf download GEAR-Dreams/DreamZero-DROID --local-dir checkpoints/DreamZero-DROID
 ```
@@ -569,7 +571,7 @@ video augmentation (crop, color jitter, dropped exterior view).
 # Integration check: DreamZero-DROID on joint-space DROID with its own published stats
 python -m training.prepare_data --tasks droid_subset --dataset-source droid --max-episodes-per-task 300
 python -m training.tools.dreamzero_stats --out dreamzero_droid_stats.json
-python -m training.train --tasks droid_subset --policy-type dreamzero \
+python -m training.train --tasks droid_subset --dataset-source droid --policy-type dreamzero \
     --dreamzero-wan-ckpt-dir checkpoints/Wan2.1-I2V-14B-480P \
     --dreamzero-pretrained-path checkpoints/DreamZero-DROID \
     --normalization-stats-source explicit_file --normalization-explicit-stats-file dreamzero_droid_stats.json \

@@ -833,6 +833,15 @@ def main() -> None:
         if not m.wan_ckpt_dir:
             parser.error("--dreamzero-wan-ckpt-dir is required for --policy-type dreamzero (DreamZero loads its "
                          "umt5/CLIP/VAE weights from it, downloading ~45GB itself if it's missing)")
+        # Ray workers run from a copy of the repo, so relative paths must be resolved here.
+        for field, flag in (("wan_ckpt_dir", "wan-ckpt-dir"), ("pretrained_path", "pretrained-path")):
+            path = getattr(m, field)
+            if path and "://" not in path:
+                if not os.path.isdir(path):
+                    parser.error(f"--dreamzero-{flag} {path} is not a directory")
+                setattr(m, field, os.path.abspath(path))
+        if m.tokenizer_path and os.path.isdir(m.tokenizer_path):
+            m.tokenizer_path = os.path.abspath(m.tokenizer_path)
         if m.distributed_strategy == "fsdp2" and m.train_mode != "fft":
             parser.error("--dreamzero-distributed-strategy fsdp2 only makes sense with --dreamzero-train-mode fft")
 
