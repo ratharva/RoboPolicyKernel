@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 from dataclasses import dataclass
 
 from training.common.robots import RobotSchema
@@ -70,6 +71,25 @@ def _read_jsonl_prefix(fs, path: str, num_episodes: int) -> list[str]:
     return lines
 
 
+def _renumber_index(root: str, info: dict, num_episodes: int) -> None:
+    """cadene/droid_1.0.1's `index` column restarts at 0 at episode 47 (and likely elsewhere), but
+    v3 meta ranges are a running total and Ray's read_lerobot selects rows by `index`."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from tqdm import tqdm
+
+    offset = 0
+    for ep in tqdm(range(num_episodes), desc="renumber index", unit="ep"):
+        path = os.path.join(root, info["data_path"].format(episode_chunk=ep // info["chunks_size"], episode_index=ep))
+        table = pq.read_table(path)
+        col = table.schema.get_field_index("index")
+        idx = pa.array(np.arange(offset, offset + table.num_rows), type=table.schema.field(col).type)
+        if not table.column(col).equals(pa.chunked_array([idx])):
+            pq.write_table(table.set_column(col, "index", idx), path)
+        offset += table.num_rows
+
+
 def _download_v21(repo_id: str, revision: str | None, root: str, max_episodes: int) -> int:
     """Downloads a v2.1 mirror at the pinned revision into root -- only its first max_episodes
     episodes, with meta trimmed to match. Returns the episode count downloaded."""
@@ -114,6 +134,8 @@ def _download_v21(repo_id: str, revision: str | None, root: str, max_episodes: i
             splits={"train": f"0:{n}"},
         )
 
+    _renumber_index(root, info, n)
+
     # cadene/droid_1.0.1 ships total_tasks=0 despite ~50k tasks; lerobot then skips loading them.
     with open(os.path.join(meta, "tasks.jsonl")) as f:
         info["total_tasks"] = sum(1 for line in f if line.strip())
@@ -148,7 +170,13 @@ def prepare(
         print(f"downloaded {n} episode(s) of {target_repo_id} into {v3_root}")
     print(f"[3/3] converting to LeRobot v3 with lerobot's convert_dataset (data files, then videos per camera)"
           + ("" if os.path.exists(v3_root) else " -- downloads the whole repo first"))
+    # convert_dataset keeps the v2.1 copy at <root>_old, and swaps a leftover one back in over a fresh download.
+    old_root = v3_root.rstrip("/") + "_old"
+    if os.path.isdir(old_root):
+        shutil.rmtree(old_root)
     convert_dataset(repo_id=target_repo_id, root=v3_root, push_to_hub=False)
+    if os.path.isdir(old_root):
+        shutil.rmtree(old_root)
 
     params = compute_conversion_params(
         tasks, max_episodes_per_task, robot, image_size, dataset_source, revision=ingestion_cfg.revision,
